@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
-import type { ExtensionWeb, PocketHost, WebRequest } from "../host.ts";
+import type { ConversationWebRequest, ExtensionWeb, PocketHost, WebRequest } from "../host.ts";
 
 const execAsync = promisify(exec);
 
@@ -609,46 +609,63 @@ function stopClient(key: string) {
     }
 }
 
+async function getServersForCwd(cwd: string) {
+    return Promise.all(
+        Object.entries(LSP_SERVERS).map(async ([id, conf]) => {
+            const available = await isBinaryAvailable(conf.command, cwd);
+            const matched = matchesMarkers(conf.rootMarkers, cwd);
+            const running = Array.from(clients.entries())
+                .filter(([k]) => k.startsWith(`${id}:`))
+                .map(([, c]) => ({
+                    cwd: c.workspaceRoot,
+                    diagnosticsCount: Array.from(c.diagnostics.values()).reduce(
+                        (acc, cur) => acc + cur.length,
+                        0,
+                    ),
+                }));
+            return {
+                id,
+                command: conf.command,
+                fileTypes: conf.fileTypes,
+                rootMarkers: conf.rootMarkers,
+                isLinter: Boolean(conf.isLinter),
+                installCmd: conf.installCmd,
+                uninstallCmd: conf.uninstallCmd,
+                available,
+                matched,
+                running: running.length > 0,
+                instances: running,
+            };
+        }),
+    );
+}
+
 export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
     if (web) {
         web.client("pi-lsp.js", { access: "owner" });
 
+        // Global fallback
         web.route(
             "GET",
             "servers",
             async (req: WebRequest) => {
-                const cwd = process.cwd();
-                const list = await Promise.all(
-                    Object.entries(LSP_SERVERS).map(async ([id, conf]) => {
-                        const available = await isBinaryAvailable(conf.command, cwd);
-                        const matched = matchesMarkers(conf.rootMarkers, cwd);
-                        const running = Array.from(clients.entries())
-                            .filter(([k]) => k.startsWith(`${id}:`))
-                            .map(([, c]) => ({
-                                cwd: c.workspaceRoot,
-                                diagnosticsCount: Array.from(c.diagnostics.values()).reduce(
-                                    (acc, cur) => acc + cur.length,
-                                    0,
-                                ),
-                            }));
-                        return {
-                            id,
-                            command: conf.command,
-                            fileTypes: conf.fileTypes,
-                            rootMarkers: conf.rootMarkers,
-                            isLinter: Boolean(conf.isLinter),
-                            installCmd: conf.installCmd,
-                            uninstallCmd: conf.uninstallCmd,
-                            available,
-                            matched,
-                            running: running.length > 0,
-                            instances: running,
-                        };
-                    }),
-                );
+                const cwd = (req.query.get("cwd") as string) || process.cwd();
+                const list = await getServersForCwd(cwd);
                 return { servers: list, cwd };
             },
             { access: "owner" },
+        );
+
+        // Per-conversation route
+        web.conversationRoute(
+            "GET",
+            "c/:conversation/servers",
+            async (req: ConversationWebRequest) => {
+                const cwd = req.conversation.cwd;
+                const list = await getServersForCwd(cwd);
+                return { servers: list, cwd };
+            },
+            { conversation: "conversation", access: "owner" },
         );
 
         web.route(

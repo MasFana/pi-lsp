@@ -13,9 +13,14 @@ export default function setup(pocket) {
         const [filter, setFilter] = useState("detected"); // detected | running | all
         const [busy, setBusy] = useState({});
 
+        const getEndpoint = () => {
+            const cid = typeof pocket.conversationId === "function" ? pocket.conversationId() : null;
+            return cid ? `/api/x/pi-lsp/c/${cid}/servers` : "/api/x/pi-lsp/servers";
+        };
+
         const fetchServers = async () => {
             try {
-                const res = await fetch("/api/x/pi-lsp/servers");
+                const res = await fetch(getEndpoint());
                 if (res.ok) {
                     const data = await res.json();
                     setServers(data.servers || []);
@@ -30,7 +35,7 @@ export default function setup(pocket) {
 
         useEffect(() => {
             fetchServers();
-            const interval = setInterval(fetchServers, 10000);
+            const interval = setInterval(fetchServers, 8000);
             return () => clearInterval(interval);
         }, []);
 
@@ -40,7 +45,7 @@ export default function setup(pocket) {
                 await fetch(`/api/x/pi-lsp/${action}`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ serverId, ...payload }),
+                    body: JSON.stringify({ serverId, cwd, ...payload }),
                 });
                 await fetchServers();
             } catch (err) {
@@ -93,7 +98,7 @@ export default function setup(pocket) {
 
                 <div style="display: flex; flex-direction: column; gap: 0.6rem; overflow-y: auto; flex: 1;">
                     ${filtered.length === 0
-                        ? html`<div style="color: var(--text-dim, #888); font-size: 0.85rem; padding: 1rem 0;">No matching language servers.</div>`
+                        ? html`<div style="color: var(--text-dim, #888); font-size: 0.85rem; padding: 1rem 0;">No matching language servers. Click "All" to browse all 50+ available servers.</div>`
                         : filtered.map((s) => {
                               const isRunning = s.running;
                               const isBusy = busy[s.id];
@@ -212,7 +217,9 @@ export default function setup(pocket) {
     const updateStatus = async () => {
         if (typeof pocket.status !== "function") return;
         try {
-            const res = await fetch("/api/x/pi-lsp/servers");
+            const cid = typeof pocket.conversationId === "function" ? pocket.conversationId() : null;
+            const endpoint = cid ? `/api/x/pi-lsp/c/${cid}/servers` : "/api/x/pi-lsp/servers";
+            const res = await fetch(endpoint);
             if (res.ok) {
                 const data = await res.json();
                 const runningCount = (data.servers || []).filter((s) => s.running).length;
