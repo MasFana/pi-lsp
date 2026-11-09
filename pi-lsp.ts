@@ -3,14 +3,14 @@
  * Supports auto-detection, execution, tool integration, and web-based installation/management.
  */
 import { exec, spawn, type ChildProcess } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, delimiter, dirname, extname, join, resolve } from "node:path";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { Type } from "typebox";
-import { defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { defineExtension, defineTool, hook, section, ToolTask } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
-import type { ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { ConversationId, ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Host as PocketHost, Web as ExtensionWeb, WebRequest, ConversationWebRequest } from "./_pocket.d.ts";
 
 export const pocketApi = 2;
@@ -587,6 +587,13 @@ export interface PendingRequest {
     timer: NodeJS.Timeout;
 }
 
+export interface DiagnosticWaiter {
+    minVersion: number;
+    resolve: (diags: unknown[]) => void;
+    reject: (err: Error) => void;
+    timer: NodeJS.Timeout;
+}
+
 export interface ActiveClient {
     id: string;
     config: ServerConfig;
@@ -595,6 +602,9 @@ export interface ActiveClient {
     reqId: number;
     pending: Map<number, PendingRequest>;
     diagnostics: Map<string, unknown[]>;
+    diagnosticMeta: Map<string, { version?: number; stale: boolean }>;
+    diagnosticWaiters: Map<string, Set<DiagnosticWaiter>>;
+    serverCapabilities?: Record<string, unknown>;
     buffer: Buffer;
     openFiles: Map<string, { version: number; text: string }>;
     running: boolean;
@@ -603,41 +613,53 @@ export interface ActiveClient {
 
 export const clients = new Map<string, ActiveClient>();
 const starting = new Map<string, Promise<ActiveClient>>();
+let notifyChange: ((cwd: string) => void) | undefined;
+const INCOMPLETE_TOOL_RESULTS: Record<string, true> = {
+    blocked: true, invalid_arguments: true, aborted: true,
+    interrupted: true, abandoned: true, restart_limit: true,
+};
 
+function rejectAllWaiters(client: ActiveClient, err: Error): void {
+    for (const waiters of client.diagnosticWaiters.values()) {
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.reject(err);
+        }
+        waiters.clear();
+    }
+    client.diagnosticWaiters.clear();
+}
 const HEADER_DELIM = Buffer.from("\r\n\r\n");
 
-function sendLsp(client: ActiveClient, method: string, params: unknown, timeoutMs = 10000): Promise<unknown> {
+function cancellationError(signal: AbortSignal): Error {
+    return signal.reason instanceof Error ? signal.reason : new Error("LSP request canceled");
+}
+
+function sendLsp(client: ActiveClient, method: string, params: unknown, timeoutMs = 10000, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) return Promise.reject(cancellationError(signal));
     if (!client.running && method !== "initialize" && method !== "shutdown") {
         return Promise.reject(new Error(`LSP server ${client.id} is not running`));
     }
-    if (!client.process.stdin?.writable) {
-        return Promise.reject(new Error(`LSP server ${client.id} stdin is not writable`));
-    }
+    if (!client.process.stdin?.writable) return Promise.reject(new Error(`LSP server ${client.id} stdin is not writable`));
     const id = ++client.reqId;
-    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    const content = Buffer.from(msg, "utf8");
+    const content = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, method, params }), "utf8");
     const header = Buffer.from(`Content-Length: ${content.length}\r\n\r\n`, "utf8");
-    const full = Buffer.concat([header, content]);
-
-    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
-
-    const timer = setTimeout(() => {
-        if (client.pending.has(id)) {
-            client.pending.delete(id);
-            reject(new Error(`LSP request ${method} (id ${id}) timed out after ${timeoutMs}ms`));
-        }
-    }, timeoutMs);
-
-    client.pending.set(id, { resolve, reject, timer });
-
-    client.process.stdin.write(full, (err) => {
-        if (err) {
-            clearTimeout(timer);
-            client.pending.delete(id);
-            reject(err);
-        }
-    });
-
+    const { promise, resolve: complete, reject: fail } = Promise.withResolvers<unknown>();
+    const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        client.pending.delete(id);
+    };
+    const reject = (error: unknown) => { cleanup(); fail(error); };
+    const onAbort = () => {
+        if (!client.pending.has(id)) return;
+        reject(cancellationError(signal!));
+        notifyLsp(client, "$/cancelRequest", { id });
+    };
+    const timer = setTimeout(() => reject(new Error(`LSP request ${method} (id ${id}) timed out after ${timeoutMs}ms`)), timeoutMs);
+    client.pending.set(id, { resolve: (result) => { cleanup(); complete(result); }, reject, timer });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    client.process.stdin.write(Buffer.concat([header, content]), (error) => { if (error) reject(error); });
     return promise;
 }
 
@@ -726,8 +748,27 @@ function handleLspData(client: ActiveClient, chunk: Buffer) {
                     sendLspResponse(client, parsed.id, undefined, { code: -32601, message: `Unsupported method: ${parsed.method}` });
                 }
             } else if (parsed.method === "textDocument/publishDiagnostics") {
-                if (parsed.params?.uri) {
-                    client.diagnostics.set(parsed.params.uri, parsed.params.diagnostics || []);
+                if (typeof parsed.params?.uri === "string" && Array.isArray(parsed.params.diagnostics)) {
+                    if (parsed.params.version !== undefined && !Number.isInteger(parsed.params.version)) continue;
+                    const uri = parsed.params.uri;
+                    const diags = parsed.params.diagnostics;
+                    const version = Number.isInteger(parsed.params.version) ? parsed.params.version : undefined;
+
+                    const fileInfo = client.openFiles.get(uri);
+                    if (fileInfo && version !== undefined && version !== fileInfo.version) {
+                        // A report for another document version cannot validate the current text.
+                    } else {
+                        client.diagnostics.set(uri, diags);
+                        client.diagnosticMeta.set(uri, { version, stale: false });
+
+                        const waiters = client.diagnosticWaiters.get(uri);
+                        if (waiters && waiters.size > 0) {
+                            for (const waiter of waiters) {
+                                if (version === undefined || version >= waiter.minVersion) waiter.resolve(diags);
+                            }
+                        }
+
+                    }
                 }
             }
         } catch {}
@@ -784,6 +825,8 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
             reqId: 0,
             pending: new Map(),
             diagnostics: new Map(),
+            diagnosticMeta: new Map(),
+            diagnosticWaiters: new Map(),
             buffer: Buffer.alloc(0),
             openFiles: new Map(),
             running: false,
@@ -808,6 +851,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                 req.reject(err);
             }
             client.pending.clear();
+            rejectAllWaiters(client, err);
             rejectEarlySpawn(err);
         }
 
@@ -846,7 +890,8 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                                 didSave: false,
                             },
                             definition: { dynamicRegistration: false, linkSupport: true },
-                            publishDiagnostics: { relatedInformation: true },
+                            publishDiagnostics: { relatedInformation: true, versionSupport: true },
+                            diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
                         },
                         workspace: {
                             configuration: true,
@@ -864,6 +909,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                 throw new Error(`LSP server ${id} stopped during initialization`);
             }
 
+            client.serverCapabilities = initialized.capabilities as Record<string, unknown>;
             client.running = true;
             proc.removeListener("error", onEarlyError);
             proc.removeListener("exit", onEarlyExit);
@@ -878,6 +924,8 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                     req.reject(err);
                 }
                 client.pending.clear();
+                rejectAllWaiters(client, err);
+                notifyChange?.(client.workspaceRoot);
             });
 
             proc.on("exit", (code, signal) => {
@@ -891,8 +939,9 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                     req.reject(err);
                 }
                 client.pending.clear();
+                rejectAllWaiters(client, err);
+                notifyChange?.(client.workspaceRoot);
             });
-
 
             notifyLsp(client, "initialized", {});
 
@@ -902,6 +951,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                 });
             }
 
+            notifyChange?.(resolvedCwd);
             return client;
         } catch (err) {
             cleanupEarly(err instanceof Error ? err : new Error(String(err)));
@@ -932,7 +982,8 @@ export async function stopClient(key: string): Promise<void> {
         req.reject(new Error("LSP client stopped"));
     }
     client.pending.clear();
-
+    rejectAllWaiters(client, new Error("LSP client stopped"));
+    notifyChange?.(client.workspaceRoot);
     const proc = client.process;
     if (proc.exitCode !== null || proc.killed) return;
 
@@ -1054,15 +1105,23 @@ function detectLanguageId(filePath: string): string {
     }
 }
 
-function syncFileToClient(client: ActiveClient, absPath: string): string {
+export function syncFileToClient(client: ActiveClient, absPath: string): { uri: string; version: number; changed: boolean } {
     const uri = pathToFileURL(absPath).href;
     const text = readFileSync(absPath, "utf8");
     const languageId = detectLanguageId(absPath);
 
     const previous = client.openFiles.get(uri);
-    if (previous?.text === text) return uri;
+    if (previous && previous.text === text) {
+        return { uri, version: previous.version, changed: false };
+    }
+
     const version = (previous?.version ?? 0) + 1;
     client.openFiles.set(uri, { version, text });
+    client.diagnostics.delete(uri);
+    client.diagnosticMeta.set(uri, { stale: true });
+    const obsolete = client.diagnosticWaiters.get(uri);
+    if (obsolete) for (const waiter of obsolete) waiter.reject(new Error("File changed during its diagnostic check"));
+
     if (!previous) {
         notifyLsp(client, "textDocument/didOpen", {
             textDocument: { uri, languageId, version, text },
@@ -1073,11 +1132,148 @@ function syncFileToClient(client: ActiveClient, absPath: string): string {
             contentChanges: [{ text }],
         });
     }
-    return uri;
+    return { uri, version, changed: true };
+}
+
+export async function waitForFreshDiagnostics(
+    client: ActiveClient,
+    uri: string,
+    targetVersion: number,
+    context?: Context,
+    timeoutMs = 5000,
+): Promise<unknown[]> {
+    context?.abortSignal?.throwIfAborted();
+    if (!client.running) throw new Error(`LSP client ${client.id} is not running`);
+    if (client.openFiles.get(uri)?.version !== targetVersion) throw new Error("Diagnostic check was superseded by another file version");
+    const meta = client.diagnosticMeta.get(uri);
+    if (meta && !meta.stale && (meta.version === undefined || meta.version === targetVersion)) {
+        return client.diagnostics.get(uri)!;
+    }
+    const provider = client.serverCapabilities?.diagnosticProvider;
+    if (provider) {
+        const report = await sendLsp(client, "textDocument/diagnostic", {
+            textDocument: { uri },
+            ...(isObject(provider) && typeof provider.identifier === "string" ? { identifier: provider.identifier } : {}),
+        }, timeoutMs, context?.abortSignal);
+        context?.abortSignal?.throwIfAborted();
+        if (client.openFiles.get(uri)?.version !== targetVersion) throw new Error("Diagnostic check was superseded by another file version");
+        if (!isObject(report) || report.kind !== "full" || !Array.isArray(report.items)) {
+            throw new Error(`Invalid diagnostic report from ${client.id}; file not verified`);
+        }
+        client.diagnostics.set(uri, report.items);
+        client.diagnosticMeta.set(uri, { version: targetVersion, stale: false });
+        return report.items;
+    }
+    const { promise, resolve: complete, reject: fail } = Promise.withResolvers<unknown[]>();
+    const signal = context?.abortSignal;
+    const cleanup = () => {
+        clearTimeout(waiter.timer);
+        signal?.removeEventListener("abort", onAbort);
+        const pending = client.diagnosticWaiters.get(uri);
+        pending?.delete(waiter);
+        if (pending?.size === 0) client.diagnosticWaiters.delete(uri);
+    };
+    const onAbort = () => waiter.reject(cancellationError(signal!));
+    const waiter: DiagnosticWaiter = {
+        minVersion: targetVersion,
+        resolve: (diagnostics) => { cleanup(); complete(diagnostics); },
+        reject: (error) => { cleanup(); fail(error); },
+        timer: setTimeout(() => waiter.reject(new Error(`No fresh diagnostics from ${client.id} within ${timeoutMs}ms; file not verified`)), timeoutMs),
+    };
+    let pending = client.diagnosticWaiters.get(uri);
+    if (!pending) client.diagnosticWaiters.set(uri, pending = new Set());
+    pending.add(waiter);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    return promise;
+}
+
+export function findBestServerForExt(ext: string, cwd: string): { id: string; conf: ServerConfig } | undefined {
+    let best: { id: string; conf: ServerConfig } | undefined;
+    for (const [id, conf] of Object.entries(LSP_SERVERS)) {
+        if (!conf.fileTypes.some((fileType) => fileType.toLowerCase() === ext)) {
+            continue;
+        }
+        if (findExecutable(conf.command, cwd) === undefined) {
+            continue;
+        }
+        if (!best) {
+            best = { id, conf };
+            if (!conf.isLinter) break;
+        } else if (best.conf.isLinter && !conf.isLinter) {
+            best = { id, conf };
+            break;
+        }
+    }
+    return best;
+}
+
+function isOwner(host: PocketHost, conversationId?: ConversationId): boolean {
+    if (conversationId === undefined) return false;
+    const requester = host.requesterOf(conversationId);
+    return requester !== undefined && host.roleOf(requester) === "owner";
+}
+
+function assertOwner(host: PocketHost, conversationId?: ConversationId, action = "perform this action"): void {
+    if (!isOwner(host, conversationId)) throw new Error(`Only the Pocket owner can ${action}`);
+}
+
+function diagnosticSummary(diagnostics: unknown[]): string {
+    return diagnostics.slice(0, 10).map((diagnostic) => {
+        if (!isObject(diagnostic)) return "Unstructured diagnostic";
+        const start = isObject(diagnostic.range) && isObject(diagnostic.range.start) ? diagnostic.range.start : undefined;
+        const line = typeof start?.line === "number" ? start.line + 1 : "?";
+        const column = typeof start?.character === "number" ? start.character + 1 : "?";
+        const severity = diagnostic.severity === 1 ? "error" : diagnostic.severity === 2 ? "warning"
+            : diagnostic.severity === 3 ? "information" : diagnostic.severity === 4 ? "hint" : "diagnostic";
+        const code = typeof diagnostic.code === "string" || typeof diagnostic.code === "number" ? ` ${diagnostic.code}` : "";
+        const message = typeof diagnostic.message === "string" ? diagnostic.message.replace(/\s+/g, " ").slice(0, 500) : "Unstructured diagnostic";
+        return `line ${line}:${column} [${severity}${code}] ${message}`;
+    }).join("\n") + (diagnostics.length > 10 ? `\n...and ${diagnostics.length - 10} more` : "");
+}
+
+async function diagnoseFile(host: PocketHost, conversationId: ConversationId, cwd: string, file: string, context: Context) {
+    assertOwner(host, conversationId, "synchronize files with language servers");
+    context.abortSignal?.throwIfAborted();
+    if (!statSync(file).isFile()) throw new Error("Diagnostic target is not a source file");
+    const ext = extname(file).toLowerCase();
+    let matching = Array.from(clients.values()).filter((client) => client.running && client.workspaceRoot === cwd
+        && client.config.fileTypes.some((fileType) => fileType.toLowerCase() === ext));
+    if (matching.length === 0) {
+        const candidate = findBestServerForExt(ext, cwd);
+        if (!candidate) throw new Error(`No installed language server matches ${ext || "this filename"}; file not checked`);
+        matching = [await startServer(candidate.id, candidate.conf, cwd)];
+    }
+    assertOwner(host, conversationId, "synchronize files with language servers");
+    context.abortSignal?.throwIfAborted();
+    const synced = matching.map((client) => ({ client, ...syncFileToClient(client, file) }));
+    const reports = await Promise.allSettled(synced.map(({ client, uri, version }) => waitForFreshDiagnostics(client, uri, version, context)));
+    assertOwner(host, conversationId, "read file diagnostics");
+    context.abortSignal?.throwIfAborted();
+    const diagnostics: unknown[] = [];
+    const failures: string[] = [];
+    reports.forEach((report, index) => {
+        if (report.status === "fulfilled") diagnostics.push(...report.value);
+        else failures.push(`${matching[index].id}: ${report.reason instanceof Error ? report.reason.message : "diagnostic request failed"}`);
+    });
+    if (failures.length) throw new Error(`Incomplete LSP check; file not verified. ${failures.join("; ")}${diagnostics.length ? `\n${diagnosticSummary(diagnostics)}` : ""}`);
+    notifyChange?.(cwd);
+    return { uri: pathToFileURL(file).href, diagnostics };
 }
 
 export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
+    notifyChange = (cwd: string) => {
+        try { web?.send("lsp-changed", { cwd }); }
+        catch (error) { console.warn("LSP dashboard update failed", error); }
+    };
+
     if (web) {
+        web.settings([{
+            name: "autoCheck",
+            type: "boolean",
+            default: true,
+            label: "Automatic post-edit diagnostics",
+            description: "Start available servers and check local source files after successful owner edit/write calls. Never installs packages.",
+        }]);
         web.client("pi-lsp.js", { access: "owner" });
 
         web.route(
@@ -1202,7 +1398,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             { access: "owner" },
         );
         web.onDispose(async () => {
-            await stopAllClients();
+            const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<void>();
+            const timer = setTimeout(resolveTimeout, 3000);
+            await Promise.race([stopAllClients(), timeoutPromise]);
+            clearTimeout(timer);
         });
     }
 
@@ -1211,9 +1410,9 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         description: "Check status of active and detected Language Servers (LSP) in workspace.",
         parameters: Type.Object({}),
         async execute(_args, api, context) {
-            const cwd = await getSessionCwd(api, context);
+            const resolvedCwd = await getSessionCwd(api, context);
             const active = Array.from(clients.values())
-                .filter((c) => c.workspaceRoot === cwd && c.running)
+                .filter((c) => c.workspaceRoot === resolvedCwd && c.running)
                 .map((c) => ({
                     id: c.id,
                     command: c.config.command,
@@ -1226,11 +1425,11 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
 
             const detected = [];
             for (const [id, conf] of Object.entries(LSP_SERVERS)) {
-                if (matchesMarkersOrExtensions(conf, cwd)) {
+                if (matchesMarkersOrExtensions(conf, resolvedCwd)) {
                     detected.push({
                         id,
                         command: conf.command,
-                        available: findExecutable(conf.command, cwd) !== undefined,
+                        available: findExecutable(conf.command, resolvedCwd) !== undefined,
                         installCmd: conf.installCmd,
                     });
                 }
@@ -1240,7 +1439,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 output: [
                     {
                         type: "text" as const,
-                        text: JSON.stringify({ active, detected, cwd }, null, 2),
+                        text: JSON.stringify({ active, detected, cwd: resolvedCwd }, null, 2),
                     },
                 ],
             };
@@ -1254,37 +1453,22 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             file: Type.Optional(Type.String({ description: "Optional specific file path" })),
         }),
         async execute(args, api, context) {
+            if (args.file) assertOwner(host, api.conversationId, "request diagnostics for a file");
             const cwd = await getSessionCwd(api, context);
-            const matching = Array.from(clients.values()).filter((c) => c.workspaceRoot === cwd && c.running);
-
             if (args.file) {
-                const absPath = args.file.startsWith("/") ? args.file : join(cwd, args.file);
-                for (const c of matching) {
-                    syncFileToClient(c, absPath);
+                const report = await diagnoseFile(host, api.conversationId, cwd, resolve(cwd, args.file), context);
+                return { output: [{ type: "text" as const, text: JSON.stringify({ [report.uri]: report.diagnostics }, null, 2) }] };
+            }
+            const results: Record<string, unknown[]> = {};
+            for (const client of clients.values()) {
+                if (!client.running || client.workspaceRoot !== cwd) continue;
+                for (const [uri, diagnostics] of client.diagnostics) {
+                    if (client.diagnosticMeta.get(uri)?.stale) continue;
+                    if (results[uri]) results[uri].push(...diagnostics);
+                    else results[uri] = [...diagnostics];
                 }
             }
-
-            const results: Record<string, unknown> = {};
-            for (const c of matching) {
-                for (const [uri, diags] of c.diagnostics.entries()) {
-                    if (
-                        !args.file ||
-                        uri.endsWith(args.file) ||
-                        uri === pathToFileURL(resolve(cwd, args.file)).href
-                    ) {
-                        results[uri] = diags;
-                    }
-                }
-            }
-
-            return {
-                output: [
-                    {
-                        type: "text" as const,
-                        text: JSON.stringify(results, null, 2),
-                    },
-                ],
-            };
+            return { output: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
         },
     });
 
@@ -1298,25 +1482,26 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             character: Type.Number({ description: "0-based character offset" }),
         }),
         async execute(args, api, context) {
-            const cwd = await getSessionCwd(api, context);
-            let client = clients.get(`${args.server}:${cwd}`);
+            assertOwner(host, api.conversationId, "jump to definition");
+            const resolvedCwd = await getSessionCwd(api, context);
+            assertOwner(host, api.conversationId, "jump to definition");
+            context.abortSignal?.throwIfAborted();
+            let client = clients.get(`${args.server}:${resolvedCwd}`);
             if (!client || !client.running) {
-                const conf = LSP_SERVERS[args.server];
-                if (!conf) {
-                    return {
-                        output: [{ type: "text" as const, text: `Unknown server ${args.server}` }],
-                    };
-                }
-                client = await startServer(args.server, conf, cwd);
+                const conf = Object.hasOwn(LSP_SERVERS, args.server) ? LSP_SERVERS[args.server] : undefined;
+                if (!conf) throw new Error(`Unknown server ${args.server}`);
+                client = await startServer(args.server, conf, resolvedCwd);
+                assertOwner(host, api.conversationId, "jump to definition");
+                context.abortSignal?.throwIfAborted();
             }
 
-            const absPath = args.file.startsWith("/") ? args.file : join(cwd, args.file);
-            const uri = syncFileToClient(client, absPath);
+            const absPath = args.file.startsWith("/") ? resolve(args.file) : resolve(resolvedCwd, args.file);
+            const { uri } = syncFileToClient(client, absPath);
 
             const res = await sendLsp(client, "textDocument/definition", {
                 textDocument: { uri },
                 position: { line: args.line, character: args.character },
-            });
+            }, 10000, context.abortSignal);
 
             return {
                 output: [
@@ -1342,71 +1527,29 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             ]),
         }),
         async execute(args, api, context) {
-            if (args.action === "install" || args.action === "uninstall") {
-                const requester = host.requesterOf(api.conversationId);
-                if (!requester || host.roleOf(requester) !== "owner") {
-                    throw new Error("Only the owner can install or uninstall language servers");
+            assertOwner(host, api.conversationId, "manage language servers");
+            const resolvedCwd = await getSessionCwd(api, context);
+            assertOwner(host, api.conversationId, "manage language servers");
+            context.abortSignal?.throwIfAborted();
+            const conf = Object.hasOwn(LSP_SERVERS, args.server) ? LSP_SERVERS[args.server] : undefined;
+            if (!conf) throw new Error(`Unsupported server ${args.server}`);
+            switch (args.action) {
+                case "stop":
+                    await stopClient(`${args.server}:${resolvedCwd}`);
+                    return { output: [{ type: "text" as const, text: `Stopped ${args.server}` }] };
+                case "start":
+                    await startServer(args.server, conf, resolvedCwd);
+                    return { output: [{ type: "text" as const, text: `Started ${args.server} for ${resolvedCwd}` }] };
+                case "install":
+                case "uninstall": {
+                    const command = args.action === "install" ? conf.installCmd : conf.uninstallCmd;
+                    if (!command) throw new Error(`No ${args.action} command for ${args.server}`);
+                    const { stdout, stderr } = await execAsync(command);
+                    return { output: [{ type: "text" as const, text: `${args.action === "install" ? "Installed" : "Uninstalled"}:\n${stdout || stderr}` }] };
                 }
+                default:
+                    throw new Error("Unsupported language-server action");
             }
-            const cwd = await getSessionCwd(api, context);
-            const key = `${args.server}:${cwd}`;
-
-            if (args.action === "stop") {
-                await stopClient(key);
-                return { output: [{ type: "text" as const, text: `Stopped ${args.server}` }] };
-            }
-
-            const conf = LSP_SERVERS[args.server];
-            if (!conf) {
-                return { output: [{ type: "text" as const, text: `Unsupported server ${args.server}` }] };
-            }
-
-            if (args.action === "start") {
-                try {
-                    await startServer(args.server, conf, cwd);
-                    return {
-                        output: [{ type: "text" as const, text: `Started ${args.server} for ${cwd}` }],
-                    };
-                } catch (err: unknown) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    return {
-                        output: [
-                            {
-                                type: "text" as const,
-                                text: `Failed to start ${args.server}: ${msg}. Install command: ${conf.installCmd || "none"}`,
-                            },
-                        ],
-                    };
-                }
-            }
-
-            if (args.action === "install") {
-                if (!conf.installCmd) {
-                    return { output: [{ type: "text" as const, text: `No install command for ${args.server}` }] };
-                }
-                try {
-                    const { stdout, stderr } = await execAsync(conf.installCmd);
-                    return { output: [{ type: "text" as const, text: `Installed:\n${stdout || stderr}` }] };
-                } catch (err: unknown) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    return { output: [{ type: "text" as const, text: `Install failed: ${msg}` }] };
-                }
-            }
-
-            if (args.action === "uninstall") {
-                if (!conf.uninstallCmd) {
-                    return { output: [{ type: "text" as const, text: `No uninstall command for ${args.server}` }] };
-                }
-                try {
-                    const { stdout, stderr } = await execAsync(conf.uninstallCmd);
-                    return { output: [{ type: "text" as const, text: `Uninstalled:\n${stdout || stderr}` }] };
-                } catch (err: unknown) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    return { output: [{ type: "text" as const, text: `Uninstall failed: ${msg}` }] };
-                }
-            }
-
-            return { output: [{ type: "text" as const, text: "Invalid action" }] };
         },
     });
 
@@ -1417,6 +1560,71 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             Object.assign(lspDiagnosticsTool, { annotations: { readOnlyHint: true } }),
             lspDefinitionTool,
             lspManageTool,
+        ],
+        sections: [
+            section("lsp_workflow", (input, _context) => {
+                const hasTool = input.agent.tools.some((t) => t.name.startsWith("lsp_")) ||
+                    input.agent.callable.some((t) => t.name.startsWith("lsp_") && t.callers?.includes("model") === false);
+                if (!hasTool) return undefined;
+
+                const owner = isOwner(host, input.conversationId);
+                const autoCheck = web?.setting("autoCheck") !== false;
+
+                if (owner) {
+                    return [
+                        "LSP Workflow:",
+                        `- After successful source edits, fix issues in the automatic LSP report. ${autoCheck ? "Automatic checks are enabled for edit/write calls." : "Automatic checks are disabled; call lsp_diagnostics with the edited file."}`,
+                        "- Use lsp_diagnostics with file to check saved external edits or when no automatic report was produced. Without file it returns received cache, not a full workspace check.",
+                        "- Diagnostics aren't tests: LSP diagnostics report syntax and type issues, but do not replace executing test suites.",
+                        "- Lazy startup: The best matching available compiler/linter server starts automatically on the first diagnostic or definition request for a file.",
+                        "- Unsupported files: If no language server is available for a file type, diagnostics are skipped; do not assume the file is error-free.",
+                        "- Definition offsets: lsp_definition takes 0-based line and UTF-16 character offsets.",
+                        "- Owner capabilities: Managing language servers, jumping to definitions, and synchronizing files for diagnostics require the Pocket owner role.",
+                        "- No autonomous installs: Do not install language server packages autonomously; ask the owner first.",
+                    ].join("\n");
+                }
+
+                return [
+                    "LSP Workflow:",
+                    "- Read-only diagnostics: You can inspect cached workspace status and diagnostics via lsp_status and lsp_diagnostics (without file parameter).",
+                    "- Restricted actions: Managing language servers, file-synchronizing diagnostics, and jumping to definitions require the Pocket owner role.",
+                    "- Diagnostics aren't tests: LSP diagnostics do not replace running test suites.",
+                    "- Unsupported files: If no server is running for a file type, diagnostics are unavailable.",
+                ].join("\n");
+            }),
+        ],
+        hooks: [
+            hook(ToolTask, {
+                afterTool: async (call, result, api, context) => {
+                    if ((call.name !== "edit" && call.name !== "write") || result.isError
+                        || result.diagnostics?.some((diagnostic) => diagnostic.severity === "error"
+                            || (typeof diagnostic.code === "string" && Object.hasOwn(INCOMPLETE_TOOL_RESULTS, diagnostic.code)))
+                        || context.abortSignal?.aborted || !isOwner(host, api.conversationId)
+                        || web?.setting("autoCheck") === false) return undefined;
+                    const file = typeof call.arguments.path === "string" ? call.arguments.path : "";
+                    if (!file) return undefined;
+                    const cwd = host.cwdOf(api.conversationId);
+                    if (workspaceScheme(cwd)) return undefined;
+                    const resolvedCwd = resolve(cwd);
+                    const absolute = resolve(resolvedCwd, file);
+                    if (basename(absolute).startsWith(".env")) return undefined;
+                    const ext = extname(absolute).toLowerCase();
+                    if (!Object.values(LSP_SERVERS).some((config) => config.fileTypes.some((fileType) => fileType.toLowerCase() === ext))) return undefined;
+                    let summary: string;
+                    try {
+                        const within = relative(realpathSync(resolvedCwd), realpathSync(absolute));
+                        if (within === ".." || within.startsWith(`..${sep}`)) return undefined;
+                        const report = await diagnoseFile(host, api.conversationId, resolvedCwd, absolute, context);
+                        summary = report.diagnostics.length
+                            ? `[LSP diagnostics for ${basename(absolute)}:\n${diagnosticSummary(report.diagnostics)}]`
+                            : `[LSP: checked ${basename(absolute)}, no issues reported for this file]`;
+                    } catch (error) {
+                        if (!isOwner(host, api.conversationId) || context.abortSignal?.aborted) return undefined;
+                        summary = `[LSP: ${basename(absolute)} not verified: ${error instanceof Error ? error.message : "diagnostic check failed"}]`;
+                    }
+                    return { ...result, output: [...(result.output ?? []), { type: "text" as const, text: summary }] };
+                },
+            }),
         ],
     });
 }

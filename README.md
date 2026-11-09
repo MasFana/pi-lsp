@@ -1,6 +1,6 @@
 # Pi LSP
 
-Language Server Protocol (LSP) integration for [Pi Pocket](https://github.com/TannerMidd/pi-pocket) with an owner management dashboard and agent tools (`lsp_status`, `lsp_diagnostics`, `lsp_definition`, `lsp_manage`). Published via the [OMP Registry](https://github.com/MasFana/OMP); source at [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp).
+Language Server Protocol (LSP) integration for [Pi Pocket](https://github.com/TannerMidd/pi-pocket): lazy server startup, post-edit diagnostics, prompt guidance, custom tool-call presentations, and an owner management dashboard. Published via the [OMP Registry](https://github.com/MasFana/OMP); source at [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp).
 
 Requires Pi Pocket `>= 0.28.0` (`pocketApi = 2`), Node `>= 22.19.0` (native TypeScript execution), and `Type` imported directly from `typebox`.
 
@@ -23,16 +23,27 @@ Copy `pi-lsp.ts` and `pi-lsp.js` to Pi Pocket's data directory `extensions/`. En
 - **Executable Lookup**: `findExecutable` checks relative paths against CWD, walks upward through ancestor `node_modules/.bin` directories to the root, then scans system `PATH` (incorporating `PATHEXT` on Windows). Projects detect via upward `rootMarkers` or source file extensions (`fileTypes`).
 - **Stdio RPC Protocol**: Framed with JSON-RPC 2.0 over standard I/O using byte-length headers (`Content-Length: <bytes>\r\n\r\n`). Client and server request IDs are isolated; unhandled incoming server requests receive JSON-RPC `-32601`. Broken stdio pipes abort pending requests and cleanly tear down child processes.
 - **Concurrency & shutdown:** One process per `${server}:${workspaceRoot}`; concurrent starts share an initialization promise. Initialization and ordinary requests time out after 10 seconds. Stop attempts `shutdown` RPC for at most 1 second, sends `exit`, then schedules `SIGTERM` after 500 ms and `SIGKILL` after 1,500 ms if needed. The worst-case kill request is about 2.5 seconds after stop, within Pocket's 3-second disposal window.
-- **File Sync & Diagnostics**: URIs are encoded via `pathToFileURL` (handles Unicode, spaces, and `#`). `syncFileToClient` compares content against an in-memory version cache: sends `textDocument/didOpen` on first load, `textDocument/didChange` (full sync) on edits, and avoids re-sending unchanged files to prevent resetting server diagnostic debounce timers. Diagnostics arrive asynchronously via `textDocument/publishDiagnostics` into an in-memory client cache.
+- **File Sync & Diagnostics**: Encoded file URIs handle Unicode, spaces and `#`. First sync sends `didOpen`; changed text sends versioned `didChange`, invalidates the old cache, and avoids re-sending unchanged text. File checks wait up to 5 seconds for a valid current report: push diagnostics or advertised pull diagnostics. Older versioned reports are discarded; malformed/unchanged pull reports and timeouts are errors, never an empty “clean” result. Unversioned push reports cannot prove an exact document version.
+
+## Automatic Editing Workflow
+
+- `lsp_workflow` is a model prompt section explaining diagnostics, owner-only actions, lazy startup, and using `lsp_diagnostics` after edits. It appears when LSP tools are offered to the model or available through codemode-only calls. Diagnostics do not replace tests, builds, or actual runtime verification.
+- A `ToolTask.afterTool` hook checks successful **Pi `edit`/`write` calls**, including codemode calls. It appends actual diagnostics or an explicit not-verified report to the edit result without discarding the original output, diff/details, or control fields.
+- Checks run only for the current Pocket owner, recognized source extensions, and real paths within the local session workspace. Failed/blocked/aborted edits, guest edits, remote/outside paths and `.env*` files do not trigger checks. There is no filesystem watcher: external-editor or shell writes require an explicit file check.
+- If no matching server is active, start **one** installed executable matching the file extension, preferring a compiler over a linter; catalog order breaks ties. Existing matching active servers contribute combined diagnostics. No directory-wide startup, recursive source scan, or automatic package installation occurs.
+- **Owner setting:** Menu → Extensions → Pi LSP → `Automatic post-edit diagnostics` (`autoCheck`, default `true`). Turning it off suppresses new post-edit checks; it does not stop running servers or disable explicit file diagnostics/definitions. Core persists this boolean; the extension does not directly read authentication/configuration files.
+- An executable permission check is not a trust check. Auto-start can execute workspace `node_modules/.bin` code; language servers inherit the host environment (possibly credentials), receive synchronized file contents, and may independently read files or use the network. Enable automatic checks only for trusted workspaces/binaries.
 
 ## Agent Tools
 
 | Tool | Parameters | Annotations | Behavior |
 | :--- | :--- | :--- | :--- |
 | `lsp_status` | None (`{}`) | `readOnlyHint: true` | Returns `{ active: [...], detected: [...], cwd }` for session workspace. |
-| `lsp_diagnostics` | `file?: string` | `readOnlyHint: true` | Returns cached diagnostics `{ [uri]: Diagnostic[] }`. Providing `file` syncs document first. Does not perform full-tree disk walks or start servers. |
-| `lsp_definition` | `server: string`, `file: string`, `line: number`, `character: number` | None | File is absolute or relative to session CWD; positions are 0-based UTF-16 offsets. Starts an inactive server, synchronizes the file, and returns LSP location results. |
-| `lsp_manage` | `server: string`, `action: "start" \| "stop" \| "install" \| "uninstall"` | None | Controls server lifecycle. `install` and `uninstall` strictly require owner privileges (`host.roleOf(requester) === "owner"`). |
+| `lsp_diagnostics` | `file?: string` | `readOnlyHint: true` | With `file`: owner-only, lazily starts an eligible server, syncs and awaits current diagnostics `{ [uri]: Diagnostic[] }`. Without `file`: received, non-stale workspace cache only; no full-tree scan or startup. Incomplete checks fail rather than claiming clean. |
+| `lsp_definition` | `server: string`, `file: string`, `line: number`, `character: number` | None | Owner-only. Absolute or session-relative file; 0-based UTF-16 positions. Starts an inactive selected server, synchronizes the file, and returns LSP location results. |
+| `lsp_manage` | `server: string`, `action: "start" \| "stop" \| "install" \| "uninstall"` | None | All actions require the current Pocket owner. Unsupported servers/actions and lifecycle/package failures are tool errors. |
+
+`readOnlyHint` classifies filesystem effects for Plan mode; it is not authorization or an OS sandbox. Status and cached no-file diagnostics remain inspectable by permitted session participants; starting/stopping or synchronizing file data does not.
 
 ## Web Endpoints & Dashboard
 
@@ -46,8 +57,11 @@ Paths below are relative to `/api/x/pi-lsp/`. Routes require the owner and `X-Po
 ### Browser Dashboard UI
 - **Panels & Launchers**: Slide-in sheet (`pocket.sheet`), menu item (`pocket.menu`), and Cmd/Ctrl+K launcher entry (`pocket.launcher`).
 - **Filters**: `Detected` (matched markers/extensions), `Running` (active in current workspace), `All` (entire catalog).
-- **Status Badge**: Registers header badge (`${count} LSP active`, short `${count} LSP`) via `pocket.status`. Updates on conversation change, polls every 15s, and clears on 0 active servers or read failure.
-- **Resilience**: `AbortController` cancels inflight requests on sheet navigation or conversation switch. Errors display inline with a Retry action. `pocket.onDispose` clears intervals, cancels active requests, and unregisters status badges.
+- **Status Badge**: Header `${count} LSP active` / `${count} LSP`; refreshes on conversation change and `lsp-changed` events, with 15-second polling as a fallback. The sheet refreshes live too. Zero active servers or failed reads clear stale badges.
+- **Resilience**: Navigation cancels in-flight requests; errors remain visible with Retry. Disposal clears intervals, requests, subscriptions, status and presentation handles.
+
+### Tool-call presentations
+The owner browser registers `pocket.toolCall` for all four tools: status/workspace, diagnostics/file, definition/file-and-1-based display position, and management/action-and-server. Calls have a code icon, readable subjects and deduplicated group summaries. Malformed historical arguments degrade safely. This API formats **call labels/subjects**, not arbitrary result bodies or inline IDE diagnostics; normal result JSON and edit diffs remain available.
 
 ## Server Catalog (54 Server Definitions)
 
@@ -74,16 +88,16 @@ Testing requires a sibling `pi-pocket` checkout with installed dependencies. Run
 node --test pi-lsp/pi-lsp.test.ts
 ```
 
-The five regressions cover fragmented Unicode framing, server/client request-ID collisions, RPC rejection, graceful shutdown, startup failures/concurrent starts/pending-init disposal, broken stdio, session CWD/executable-file lookup, and non-owner package-management rejection. Package installers and every catalog distribution are not exercised.
+Ten regressions cover Unicode framing/request-ID collisions, startup and RPC failures, lifecycle cleanup, workspace/executable resolution, owner enforcement, lazy file checks, stale/malformed diagnostic rejection, edit-hook suppression, and canceled/expired push/pull waits. A real Pocket/TypeScript smoke exercised write → error `2322` → edit → clean report, prompt injection, custom call rendering, guest denial, the automatic toggle, and failed/invalid calls. Package installers and every catalog distribution remain untested.
 
 ## Development and Publication
 
 1. Verify tests pass, then commit and push source to [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp).
 2. In `OMP/entries/pi-lsp.json`:
-   - Bump the human release version and set `minPocket` for the APIs actually used (this correction: `1.1.3`, Pocket `0.28.0`).
+   - Bump the human release version and set `minPocket` for the APIs actually used (editing workflow: `1.2.0`, Pocket `0.28.0`).
    - Set `"source.commit"` to the pushed git commit SHA.
    - Update `files` entries for `pi-lsp.ts` and `pi-lsp.js` with exact byte sizes and SHA-256 hashes.
-   - Ensure `"declares.routes"` includes `"POST c/:conversation/start"` and `"POST c/:conversation/stop"`.
+   - Match all loaded declarations, including `sections: ["lsp_workflow"]`, `hooks: ["afterTool"]`, the four tools/two read-only hints, owner client/access and all eight routes.
 3. From `OMP/`, fetch and validate the **published** files, then build the index:
    ```sh
    node scripts/validate.ts --pocket ../pi-pocket --only pi-lsp
@@ -96,6 +110,6 @@ The five regressions cover fragmented Unicode framing, server/client request-ID 
 
 - **403 Forbidden:** Check the current loaded revision, owner/session access, and `X-Pocket: 1`. Use module-relative `pocket.api()` rather than a headerless request.
 - **Stale Browser UI**: Browser cached previous JavaScript version. Click **Reload** under Menu → Extensions.
-- **Unauthorized / Permission Denied**: Installing/uninstalling language servers or invoking web routes requires the owner role.
+- **Unauthorized / Permission Denied**: Start/stop/install/uninstall, definitions and file-synchronizing diagnostics require the current requester to be the Pocket owner; an owner-only browser does not authorize guest tool calls.
 - **Server not starting:** Check executable permissions and ancestor `node_modules/.bin`/`PATH`, required runtimes, stderr/startup errors, and LSP protocol support. An available executable is not proof of successful initialization.
-- **Empty diagnostics:** Start the desired server with `lsp_manage`, then supply `file` to `lsp_diagnostics`. Results are asynchronous; an immediate call can precede publication. Without `file`, only the received cache is returned.
+- **No automatic report:** Check `autoCheck`, caller role, edit success/cancellation, local workspace containment and recognized extension. Shell/external-editor writes are not watched. For a supported file, request `lsp_diagnostics` explicitly; missing binaries, initialization failures and diagnostic timeouts mean **not verified**, not clean. Without `file`, diagnostics are cached received results only.

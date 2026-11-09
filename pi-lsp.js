@@ -3,6 +3,21 @@ export const pocketApi = 2;
 
 const CODE_ICON_PATH = "M16 18l6-6-6-6 M8 6l-6 6 6 6";
 
+const safeStr = (value) => (typeof value === "string" ? value.trim() : "");
+const parsePos = (value) => {
+    if (Number.isInteger(value) && value >= 0) return value + 1;
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+        const n = parseInt(value.trim(), 10);
+        return Number.isSafeInteger(n) && n >= 0 ? n + 1 : null;
+    }
+    return null;
+};
+const MANAGE_LABELS = {
+    start: "start language server",
+    stop: "stop language server",
+    install: "install language server",
+    uninstall: "uninstall language server",
+};
 export default function setup(pocket) {
     const { html, useEffect, useRef, useState } = pocket;
     const serverPath = (cid) => cid === null ? "servers" : `c/${cid}/servers`;
@@ -21,6 +36,13 @@ export default function setup(pocket) {
         const loadedFor = useRef(undefined);
 
         useEffect(() => pocket.onConversation(setConversationId), []);
+        useEffect(() => {
+            return pocket.on("lsp-changed", (evt) => {
+                const eventCwd = evt && typeof evt === "object" && typeof evt.cwd === "string" ? evt.cwd : "";
+                if (eventCwd && cwd && eventCwd !== cwd) return;
+                setRefresh((r) => r + 1);
+            });
+        }, [conversationId, cwd]);
 
         useEffect(() => {
             const stop = new AbortController();
@@ -262,11 +284,66 @@ export default function setup(pocket) {
             sheet: "lsp",
         });
     }
+    // Register tool call display in transcripts and peek tiles
+    const toolCallHandles = [
+        pocket.toolCall({
+            tool: "lsp_status",
+            iconPath: CODE_ICON_PATH,
+            label: () => "check LSP status",
+            subject: () => "current workspace",
+            summary: () => ({ verb: "checked LSP status" }),
+        }),
+        pocket.toolCall({
+            tool: "lsp_diagnostics",
+            iconPath: CODE_ICON_PATH,
+            label: (args) => safeStr(args?.file) ? "check file diagnostics" : "read cached diagnostics",
+            subject: (args) => safeStr(args?.file) || "current workspace",
+            summary: (args) => safeStr(args?.file)
+                ? { verb: "checked", noun: "file", by: "file" }
+                : { verb: "read cached diagnostics" },
+        }),
+        pocket.toolCall({
+            tool: "lsp_definition",
+            iconPath: CODE_ICON_PATH,
+            label: () => "find definition",
+            subject: (args) => {
+                const file = safeStr(args?.file);
+                const line = parsePos(args?.line);
+                const col = parsePos(args?.character);
+                const loc = file
+                    ? line !== null && col !== null ? `${file}:${line}:${col}`
+                        : line !== null ? `${file}:${line}` : file
+                    : line !== null && col !== null ? `${line}:${col}` : "";
+                return [loc, safeStr(args?.server)].filter(Boolean).join(" · ");
+            },
+            summary: (args) => safeStr(args?.file)
+                ? { verb: "looked up", noun: "definition", by: "file" }
+                : { verb: "looked up definitions" },
+        }),
+        pocket.toolCall({
+            tool: "lsp_manage",
+            iconPath: CODE_ICON_PATH,
+            label: (args) => {
+                const label = MANAGE_LABELS[safeStr(args?.action)];
+                return typeof label === "string" ? label : "manage language server";
+            },
+            subject: (args) => safeStr(args?.server) || "language server",
+            summary: (args) => {
+                const action = safeStr(args?.action);
+                if (action === "start") return { verb: "started", noun: "server", by: "server" };
+                if (action === "stop") return { verb: "stopped", noun: "server", by: "server" };
+                if (action === "install") return { verb: "installed", noun: "server", by: "server" };
+                if (action === "uninstall") return { verb: "uninstalled", noun: "server", by: "server" };
+                return { verb: "managed servers" };
+            },
+        }),
+    ];
 
     // Register header status badge
     let statusItem = null;
     let statusRequest = null;
     let disposed = false;
+    let lastCwd = "";
     const clearStatus = () => {
         statusItem?.remove();
         statusItem = null;
@@ -280,6 +357,7 @@ export default function setup(pocket) {
         try {
             const data = await pocket.api(serverPath(cid), undefined, { signal: stop.signal });
             if (stop.signal.aborted || disposed || pocket.conversationId() !== cid) return;
+            lastCwd = data.cwd;
             const runningCount = data.servers.filter((s) => s.running).length;
             if (runningCount > 0) {
                 const item = {
@@ -299,16 +377,26 @@ export default function setup(pocket) {
     };
 
     const stopConversation = pocket.onConversation(() => {
+        lastCwd = "";
         clearStatus();
         updateStatus();
     });
-    updateStatus();
     const statusInterval = setInterval(updateStatus, 15000);
+
+    const stopLspChanged = pocket.on("lsp-changed", (evt) => {
+        if (disposed) return;
+        const eventCwd = evt && typeof evt === "object" && typeof evt.cwd === "string" ? evt.cwd : "";
+        if (eventCwd && lastCwd && eventCwd !== lastCwd) return;
+        updateStatus();
+    });
+
     pocket.onDispose(() => {
         disposed = true;
         statusRequest?.abort();
         clearInterval(statusInterval);
         stopConversation();
+        stopLspChanged();
+        for (const handle of toolCallHandles) handle.remove();
         clearStatus();
     });
 }
