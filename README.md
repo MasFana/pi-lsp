@@ -22,7 +22,7 @@ Copy `pi-lsp.ts` and `pi-lsp.js` to Pi Pocket's data directory `extensions/`. En
 - **Workspace Authority**: CWD resolves from Durable context (`api.env.cwd` or `await api.agent(context).cwd`). Remote workspace schemes (`ssh://`, `docker://`, etc.) are explicitly rejected with an error.
 - **Executable Lookup**: `findExecutable` checks relative paths against CWD, walks upward through ancestor `node_modules/.bin` directories to the root, then scans system `PATH` (incorporating `PATHEXT` on Windows). Projects detect via upward `rootMarkers` or source file extensions (`fileTypes`).
 - **Stdio RPC Protocol**: Framed with JSON-RPC 2.0 over standard I/O using byte-length headers (`Content-Length: <bytes>\r\n\r\n`). Client and server request IDs are isolated; unhandled incoming server requests receive JSON-RPC `-32601`. Broken stdio pipes abort pending requests and cleanly tear down child processes.
-- **Concurrency & shutdown:** One process per `${server}:${workspaceRoot}`; concurrent starts share an initialization promise. Initialization and ordinary requests time out after 10 seconds. Stop attempts `shutdown` RPC (1-second timeout), sends `exit`, then waits up to 2 seconds before `SIGTERM` and another 1 second before `SIGKILL`.
+- **Concurrency & shutdown:** One process per `${server}:${workspaceRoot}`; concurrent starts share an initialization promise. Initialization and ordinary requests time out after 10 seconds. Stop attempts `shutdown` RPC for at most 1 second, sends `exit`, then schedules `SIGTERM` after 500 ms and `SIGKILL` after 1,500 ms if needed. The worst-case kill request is about 2.5 seconds after stop, within Pocket's 3-second disposal window.
 - **File Sync & Diagnostics**: URIs are encoded via `pathToFileURL` (handles Unicode, spaces, and `#`). `syncFileToClient` compares content against an in-memory version cache: sends `textDocument/didOpen` on first load, `textDocument/didChange` (full sync) on edits, and avoids re-sending unchanged files to prevent resetting server diagnostic debounce timers. Diagnostics arrive asynchronously via `textDocument/publishDiagnostics` into an in-memory client cache.
 
 ## Agent Tools
@@ -80,7 +80,7 @@ The five regressions cover fragmented Unicode framing, server/client request-ID 
 
 1. Verify tests pass, then commit and push source to [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp).
 2. In `OMP/entries/pi-lsp.json`:
-   - Set `"version": "1.1.3"` and `"minPocket": "0.28.0"`.
+   - Bump the human release version and set `minPocket` for the APIs actually used (this correction: `1.1.3`, Pocket `0.28.0`).
    - Set `"source.commit"` to the pushed git commit SHA.
    - Update `files` entries for `pi-lsp.ts` and `pi-lsp.js` with exact byte sizes and SHA-256 hashes.
    - Ensure `"declares.routes"` includes `"POST c/:conversation/start"` and `"POST c/:conversation/stop"`.
