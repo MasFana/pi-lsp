@@ -4,7 +4,8 @@ export const pocketApi = 2;
 const CODE_ICON_PATH = "M16 18l6-6-6-6 M8 6l-6 6 6 6";
 
 export default function setup(pocket) {
-    const { html, useEffect, useState } = pocket;
+    const { html, useEffect, useRef, useState } = pocket;
+    const serverPath = (cid) => cid === null ? "servers" : `c/${cid}/servers`;
 
     function LspSheet() {
         const [servers, setServers] = useState([]);
@@ -12,51 +13,97 @@ export default function setup(pocket) {
         const [loading, setLoading] = useState(true);
         const [filter, setFilter] = useState("detected"); // detected | running | all
         const [busy, setBusy] = useState({});
+        const [error, setError] = useState("");
+        const [actionError, setActionError] = useState("");
+        const [conversationId, setConversationId] = useState(pocket.conversationId());
+        const [refresh, setRefresh] = useState(0);
+        const actions = useRef(new Map());
+        const loadedFor = useRef(undefined);
 
-        const getEndpoint = () => {
-            const cid = typeof pocket.conversationId === "function" ? pocket.conversationId() : null;
-            return cid ? `/api/x/pi-lsp/c/${cid}/servers` : "/api/x/pi-lsp/servers";
-        };
-
-        const fetchServers = async () => {
-            try {
-                const res = await fetch(getEndpoint());
-                if (res.ok) {
-                    const data = await res.json();
-                    setServers(data.servers || []);
-                    setCwd(data.cwd || "");
-                }
-            } catch (err) {
-                console.error("Failed to fetch LSP servers", err);
-            } finally {
-                setLoading(false);
-            }
-        };
+        useEffect(() => pocket.onConversation(setConversationId), []);
 
         useEffect(() => {
+            const stop = new AbortController();
+            let reading = false;
+            if (loadedFor.current !== conversationId) {
+                loadedFor.current = conversationId;
+                setServers([]);
+                setCwd("");
+                setActionError("");
+                setLoading(true);
+            }
+            setError("");
+            const fetchServers = async () => {
+                if (reading) return;
+                reading = true;
+                try {
+                    const data = await pocket.api(serverPath(conversationId), undefined, { signal: stop.signal });
+                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                        setServers(data.servers);
+                        setCwd(data.cwd);
+                        setError("");
+                    }
+                } catch (failure) {
+                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                        setError(failure.message);
+                    }
+                } finally {
+                    reading = false;
+                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) setLoading(false);
+                }
+            };
             fetchServers();
             const interval = setInterval(fetchServers, 8000);
-            return () => clearInterval(interval);
-        }, []);
+            return () => {
+                stop.abort();
+                clearInterval(interval);
+            };
+        }, [conversationId, refresh]);
 
-        const runAction = async (action, serverId, payload = {}) => {
+        useEffect(() => {
+            setBusy({});
+            return () => {
+                for (const stop of actions.current.values()) stop.abort();
+                actions.current.clear();
+            };
+        }, [conversationId]);
+
+        const runAction = async (action, serverId) => {
+            if (!cwd || pocket.conversationId() !== conversationId || actions.current.has(serverId)) return;
+            const stop = new AbortController();
+            actions.current.set(serverId, stop);
             setBusy((b) => ({ ...b, [serverId]: action }));
+            setActionError("");
+            const bound = conversationId !== null && (action === "start" || action === "stop");
             try {
-                await fetch(`/api/x/pi-lsp/${action}`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ serverId, cwd, ...payload }),
-                });
-                await fetchServers();
-            } catch (err) {
-                alert(`Action ${action} failed: ${err.message}`);
+                await pocket.api(bound ? `c/${conversationId}/${action}` : action,
+                    bound ? { serverId } : { serverId, cwd }, { signal: stop.signal });
+                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                    setRefresh((value) => value + 1);
+                    updateStatus();
+                }
+            } catch (failure) {
+                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                    setActionError(failure.message);
+                    pocket.notify("error", `LSP ${action} failed: ${failure.message}`);
+                }
             } finally {
-                setBusy((b) => ({ ...b, [serverId]: null }));
+                if (actions.current.get(serverId) === stop) actions.current.delete(serverId);
+                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                    setBusy((b) => ({ ...b, [serverId]: null }));
+                }
             }
         };
 
         if (loading) {
             return html`<div style="padding: 1.5rem; color: var(--text-dim, #888);">Loading LSP status...</div>`;
+        }
+
+        if (error) {
+            return html`<div style="padding: 1rem;">
+                <div class="error-box" role="alert">${error}</div>
+                <button class="button" onClick=${() => setRefresh((value) => value + 1)}>Retry LSP status</button>
+            </div>`;
         }
 
         const filtered = servers.filter((s) => {
@@ -69,7 +116,6 @@ export default function setup(pocket) {
             <div style="padding: 1rem; font-family: inherit; font-size: 0.85rem; height: 100%; display: flex; flex-direction: column;">
                 <div style="margin-bottom: 1rem; display: flex; align-items: center; justify-content: space-between;">
                     <div>
-                        <div style="font-weight: 600; font-size: 1rem;">Language Servers</div>
                         <div style="font-size: 0.75rem; color: var(--text-dim, #888); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                             ${cwd}
                         </div>
@@ -96,9 +142,14 @@ export default function setup(pocket) {
                     </div>
                 </div>
 
+                ${actionError ? html`<div class="error-box" role="alert">${actionError}</div>` : ""}
                 <div style="display: flex; flex-direction: column; gap: 0.6rem; overflow-y: auto; flex: 1;">
                     ${filtered.length === 0
-                        ? html`<div style="color: var(--text-dim, #888); font-size: 0.85rem; padding: 1rem 0;">No matching language servers. Click "All" to browse all 50+ available servers.</div>`
+                        ? html`<div class="muted" style="font-size: 0.85rem; padding: 1rem 0;">${filter === "running"
+                            ? "No language servers running for this workspace."
+                            : filter === "detected"
+                              ? `No project matches in this workspace. Click All to browse ${servers.length} supported servers.`
+                              : "No language servers returned."}</div>`
                         : filtered.map((s) => {
                               const isRunning = s.running;
                               const isBusy = busy[s.id];
@@ -214,33 +265,50 @@ export default function setup(pocket) {
 
     // Register header status badge
     let statusItem = null;
+    let statusRequest = null;
+    let disposed = false;
+    const clearStatus = () => {
+        statusItem?.remove();
+        statusItem = null;
+    };
     const updateStatus = async () => {
-        if (typeof pocket.status !== "function") return;
+        if (disposed) return;
+        statusRequest?.abort();
+        const stop = new AbortController();
+        statusRequest = stop;
+        const cid = pocket.conversationId();
         try {
-            const cid = typeof pocket.conversationId === "function" ? pocket.conversationId() : null;
-            const endpoint = cid ? `/api/x/pi-lsp/c/${cid}/servers` : "/api/x/pi-lsp/servers";
-            const res = await fetch(endpoint);
-            if (res.ok) {
-                const data = await res.json();
-                const runningCount = (data.servers || []).filter((s) => s.running).length;
-                if (runningCount > 0) {
-                    const item = {
-                        id: "lsp",
-                        title: "Language Server Protocol",
-                        label: `${runningCount} LSP active`,
-                        sheet: "lsp",
-                    };
-                    if (!statusItem) statusItem = pocket.status(item);
-                    else statusItem.update(item);
-                } else if (statusItem) {
-                    statusItem.remove();
-                    statusItem = null;
-                }
-            }
-        } catch {}
+            const data = await pocket.api(serverPath(cid), undefined, { signal: stop.signal });
+            if (stop.signal.aborted || disposed || pocket.conversationId() !== cid) return;
+            const runningCount = data.servers.filter((s) => s.running).length;
+            if (runningCount > 0) {
+                const item = {
+                    id: "lsp",
+                    title: "Language Server Protocol",
+                    text: `${runningCount} LSP active`,
+                    short: `${runningCount} LSP`,
+                    sheet: "lsp",
+                };
+                if (statusItem) statusItem.update(item);
+                else statusItem = pocket.status(item);
+            } else clearStatus();
+        } catch {
+            // An unreadable status must not leave a stale active badge.
+            if (!stop.signal.aborted && !disposed && pocket.conversationId() === cid) clearStatus();
+        }
     };
 
+    const stopConversation = pocket.onConversation(() => {
+        clearStatus();
+        updateStatus();
+    });
     updateStatus();
     const statusInterval = setInterval(updateStatus, 15000);
-    pocket.onDispose?.(() => clearInterval(statusInterval));
+    pocket.onDispose(() => {
+        disposed = true;
+        statusRequest?.abort();
+        clearInterval(statusInterval);
+        stopConversation();
+        clearStatus();
+    });
 }

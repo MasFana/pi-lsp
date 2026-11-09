@@ -1,0 +1,31 @@
+# Dependencies and type links
+node_modules
+_pocket.d.ts
+
+# Runtime logs and test artifacts
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.pi-pocket/
+*.gallery.json
+
+# Build and coverage outputs
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+
+# System files
+.DS_Store
+Thumbs.db

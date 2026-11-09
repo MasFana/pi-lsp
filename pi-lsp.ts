@@ -3,28 +3,33 @@
  * Supports auto-detection, execution, tool integration, and web-based installation/management.
  */
 import { exec, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { basename, delimiter, dirname, extname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
-import type { ConversationWebRequest, ExtensionWeb, PocketHost, WebRequest } from "../host.ts";
+import type { Context } from "@earendil-works/chord";
+import type { ToolExecutionApi } from "@earendil-works/pi-durable";
+import type { Host as PocketHost, Web as ExtensionWeb, WebRequest, ConversationWebRequest } from "./_pocket.d.ts";
+
+export const pocketApi = 2;
 
 const execAsync = promisify(exec);
+
 
 export interface ServerConfig {
     command: string;
     args?: string[];
     fileTypes: string[];
     rootMarkers: string[];
-    initOptions?: Record<string, any>;
-    settings?: Record<string, any>;
+    initOptions?: Record<string, unknown>;
+    settings?: Record<string, unknown>;
     disabled?: boolean;
     isLinter?: boolean;
     installCmd?: string;
     uninstallCmd?: string;
 }
-
 export const LSP_SERVERS: Record<string, ServerConfig> = {
     "typescript-language-server": {
         command: "typescript-language-server",
@@ -459,57 +464,224 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     },
 };
 
-interface ActiveClient {
+export function workspaceScheme(cwd?: string): string | undefined {
+    if (!cwd || typeof cwd !== "string") return undefined;
+    return /^([a-z][a-z0-9+.-]+):\/\//i.exec(cwd)?.[1]?.toLowerCase();
+}
+
+function isObject(val: unknown): val is Record<string, unknown> {
+    return typeof val === "object" && val !== null;
+}
+
+async function getSessionCwd(api: ToolExecutionApi, context: Context): Promise<string> {
+    const cwd = api.env?.cwd ?? (await api.agent(context)).cwd;
+    if (!cwd) throw new Error("No session workspace found");
+    if (workspaceScheme(cwd)) throw new Error(`Remote workspaces are not supported: ${cwd}`);
+    return resolve(cwd);
+}
+
+function isExecutableFile(candidate: string): boolean {
+    try {
+        if (!statSync(candidate).isFile()) return false;
+        accessSync(candidate, constants.X_OK);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export function findExecutable(command: string, cwd: string): string | undefined {
+    if (!command) return undefined;
+
+    if (command.includes("/") || (process.platform === "win32" && command.includes("\\"))) {
+        const direct = resolve(cwd, command);
+        if (isExecutableFile(direct)) return direct;
+        return undefined;
+    }
+
+    let cur = resolve(cwd);
+    while (true) {
+        const candidate = join(cur, "node_modules", ".bin", command);
+        if (isExecutableFile(candidate)) return candidate;
+        const parent = dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+    }
+
+    const pathDirs = (process.env.PATH || "").split(delimiter);
+    const pathext = process.platform === "win32"
+        ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
+        : [""];
+
+    for (const dir of pathDirs) {
+        if (!dir) continue;
+        for (const ext of pathext) {
+            const candidate = join(dir, command + ext);
+            if (isExecutableFile(candidate)) return candidate;
+        }
+    }
+
+    return undefined;
+}
+
+export function matchesMarkersOrExtensions(conf: ServerConfig, cwd: string): boolean {
+    if (workspaceScheme(cwd)) return false;
+
+    let cur = resolve(cwd);
+    while (true) {
+        try {
+            if (conf.rootMarkers && conf.rootMarkers.length > 0) {
+                for (const marker of conf.rootMarkers) {
+                    if (!marker.startsWith("*.")) {
+                        if (existsSync(join(cur, marker))) return true;
+                    }
+                }
+                const wildcardMarkers = conf.rootMarkers.filter((m) => m.startsWith("*."));
+                if (wildcardMarkers.length > 0) {
+                    const entries = readdirSync(cur);
+                    for (const marker of wildcardMarkers) {
+                        const ext = marker.slice(1);
+                        if (entries.some((e) => e.endsWith(ext))) return true;
+                    }
+                }
+            }
+        } catch {}
+        const parent = dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+    }
+
+    if (conf.fileTypes && conf.fileTypes.length > 0) {
+        try {
+            const entries = readdirSync(cwd, { withFileTypes: true });
+            for (const dirent of entries) {
+                if (dirent.isFile() && conf.fileTypes.some((ext) => dirent.name.endsWith(ext))) {
+                    return true;
+                }
+            }
+            for (const dirent of entries) {
+                if (
+                    dirent.isDirectory() &&
+                    !dirent.name.startsWith(".") &&
+                    dirent.name !== "node_modules" &&
+                    dirent.name !== "dist" &&
+                    dirent.name !== "build"
+                ) {
+                    try {
+                        const sub = readdirSync(join(cwd, dirent.name));
+                        if (sub.some((f) => conf.fileTypes.some((ext) => f.endsWith(ext)))) {
+                            return true;
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+
+    return false;
+}
+
+export interface PendingRequest {
+    resolve: (res: unknown) => void;
+    reject: (err: unknown) => void;
+    timer: NodeJS.Timeout;
+}
+
+export interface ActiveClient {
     id: string;
     config: ServerConfig;
     process: ChildProcess;
     workspaceRoot: string;
     reqId: number;
-    pending: Map<number, (res: any) => void>;
-    diagnostics: Map<string, any[]>;
-    buffer: string;
+    pending: Map<number, PendingRequest>;
+    diagnostics: Map<string, unknown[]>;
+    buffer: Buffer;
+    openFiles: Map<string, { version: number; text: string }>;
+    running: boolean;
+    stderrTail: string;
 }
 
-const clients = new Map<string, ActiveClient>();
+export const clients = new Map<string, ActiveClient>();
+const starting = new Map<string, Promise<ActiveClient>>();
 
-function sendLsp(client: ActiveClient, method: string, params: any): Promise<any> {
+const HEADER_DELIM = Buffer.from("\r\n\r\n");
+
+function sendLsp(client: ActiveClient, method: string, params: unknown, timeoutMs = 10000): Promise<unknown> {
+    if (!client.running && method !== "initialize" && method !== "shutdown") {
+        return Promise.reject(new Error(`LSP server ${client.id} is not running`));
+    }
+    if (!client.process.stdin?.writable) {
+        return Promise.reject(new Error(`LSP server ${client.id} stdin is not writable`));
+    }
     const id = ++client.reqId;
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    const full = `Content-Length: ${Buffer.byteLength(msg, "utf8")}\r\n\r\n${msg}`;
+    const content = Buffer.from(msg, "utf8");
+    const header = Buffer.from(`Content-Length: ${content.length}\r\n\r\n`, "utf8");
+    const full = Buffer.concat([header, content]);
 
-    return new Promise((resolve, reject) => {
-        client.pending.set(id, resolve);
-        client.process.stdin?.write(full, (err) => {
-            if (err) {
-                client.pending.delete(id);
-                reject(err);
-            }
-        });
-        setTimeout(() => {
-            if (client.pending.has(id)) {
-                client.pending.delete(id);
-                resolve({ error: "LSP request timeout" });
-            }
-        }, 10000);
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+
+    const timer = setTimeout(() => {
+        if (client.pending.has(id)) {
+            client.pending.delete(id);
+            reject(new Error(`LSP request ${method} (id ${id}) timed out after ${timeoutMs}ms`));
+        }
+    }, timeoutMs);
+
+    client.pending.set(id, { resolve, reject, timer });
+
+    client.process.stdin.write(full, (err) => {
+        if (err) {
+            clearTimeout(timer);
+            client.pending.delete(id);
+            reject(err);
+        }
     });
+
+    return promise;
 }
 
-function notifyLsp(client: ActiveClient, method: string, params: any) {
-    const msg = JSON.stringify({ jsonrpc: "2.0", method, params });
-    const full = `Content-Length: ${Buffer.byteLength(msg, "utf8")}\r\n\r\n${msg}`;
-    client.process.stdin?.write(full);
+function notifyLsp(client: ActiveClient, method: string, params: unknown): void {
+    if (!client.process.stdin?.writable) return;
+    try {
+        const msg = JSON.stringify({ jsonrpc: "2.0", method, params });
+        const content = Buffer.from(msg, "utf8");
+        const header = Buffer.from(`Content-Length: ${content.length}\r\n\r\n`, "utf8");
+        client.process.stdin.write(Buffer.concat([header, content]));
+    } catch {}
 }
 
-function handleLspData(client: ActiveClient, chunk: string) {
-    client.buffer += chunk;
+function sendLspResponse(client: ActiveClient, id: number | string, result: unknown, error?: unknown): void {
+    if (!client.process.stdin?.writable) return;
+    try {
+        const payload: Record<string, unknown> = { jsonrpc: "2.0", id };
+        if (error !== undefined) {
+            payload.error = error;
+        } else {
+            payload.result = result;
+        }
+        const msg = JSON.stringify(payload);
+        const content = Buffer.from(msg, "utf8");
+        const header = Buffer.from(`Content-Length: ${content.length}\r\n\r\n`, "utf8");
+        client.process.stdin.write(Buffer.concat([header, content]));
+    } catch {}
+}
+
+function getRequestBody(req: WebRequest): Record<string, unknown> {
+    return isObject(req.body) ? req.body : {};
+}
+
+function handleLspData(client: ActiveClient, chunk: Buffer) {
+    client.buffer = Buffer.concat([client.buffer, chunk]);
+
     while (true) {
-        const headerEnd = client.buffer.indexOf("\r\n\r\n");
+        const headerEnd = client.buffer.indexOf(HEADER_DELIM);
         if (headerEnd === -1) break;
 
-        const header = client.buffer.slice(0, headerEnd);
-        const match = /Content-Length:\s*(\d+)/i.exec(header);
+        const headerStr = client.buffer.subarray(0, headerEnd).toString("utf8");
+        const match = /Content-Length:\s*(\d+)/i.exec(headerStr);
         if (!match) {
-            client.buffer = client.buffer.slice(headerEnd + 4);
+            client.buffer = client.buffer.subarray(headerEnd + 4);
             continue;
         }
 
@@ -517,112 +689,321 @@ function handleLspData(client: ActiveClient, chunk: string) {
         const bodyStart = headerEnd + 4;
         if (client.buffer.length < bodyStart + len) break;
 
-        const bodyStr = client.buffer.slice(bodyStart, bodyStart + len);
-        client.buffer = client.buffer.slice(bodyStart + len);
+        const bodyBuf = client.buffer.subarray(bodyStart, bodyStart + len);
+        client.buffer = client.buffer.subarray(bodyStart + len);
 
         try {
-            const parsed = JSON.parse(bodyStr);
-            if (parsed.id !== undefined && client.pending.has(parsed.id)) {
-                client.pending.get(parsed.id)?.(parsed.result ?? parsed);
+            const parsed = JSON.parse(bodyBuf.toString("utf8"));
+
+            if (parsed.method === undefined && parsed.id !== undefined && client.pending.has(parsed.id)) {
+                const req = client.pending.get(parsed.id)!;
                 client.pending.delete(parsed.id);
+                clearTimeout(req.timer);
+
+                if (parsed.error !== undefined) {
+                    const err = Object.assign(
+                        new Error(parsed.error.message || `LSP RPC error ${parsed.error.code}`),
+                        { rpcError: parsed.error },
+                    );
+                    req.reject(err);
+                } else {
+                    req.resolve(parsed.result ?? null);
+                }
+            } else if (parsed.method !== undefined && parsed.id !== undefined) {
+                if (parsed.method === "workspace/configuration") {
+                    const items = Array.isArray(parsed.params?.items) ? parsed.params.items : [];
+                    const result = items.map((item: unknown) => {
+                        const section = isObject(item) && typeof item.section === "string" ? item.section : undefined;
+                        if (!section) return client.config.settings || {};
+                        return client.config.settings?.[section] ?? {};
+                    });
+                    sendLspResponse(client, parsed.id, result);
+                } else if (parsed.method === "workspace/workspaceFolders") {
+                    sendLspResponse(client, parsed.id, [
+                        { uri: pathToFileURL(client.workspaceRoot).href, name: basename(client.workspaceRoot) },
+                    ]);
+                } else {
+                    sendLspResponse(client, parsed.id, undefined, { code: -32601, message: `Unsupported method: ${parsed.method}` });
+                }
             } else if (parsed.method === "textDocument/publishDiagnostics") {
-                client.diagnostics.set(parsed.params.uri, parsed.params.diagnostics || []);
+                if (parsed.params?.uri) {
+                    client.diagnostics.set(parsed.params.uri, parsed.params.diagnostics || []);
+                }
             }
         } catch {}
     }
 }
 
-async function isBinaryAvailable(command: string, cwd: string): Promise<boolean> {
-    const localBin = join(cwd, "node_modules", ".bin", command);
-    if (existsSync(localBin)) return true;
-    try {
-        await execAsync(`which ${command}`);
-        return true;
-    } catch {
-        return false;
+export async function startServer(id: string, config: ServerConfig, cwd: string): Promise<ActiveClient> {
+    if (workspaceScheme(cwd)) {
+        throw new Error(`Remote workspaces are not supported: ${cwd}`);
     }
-}
+    const resolvedCwd = resolve(cwd);
+    const key = `${id}:${resolvedCwd}`;
 
-function matchesMarkers(rootMarkers: string[], cwd: string): boolean {
-    try {
-        const files = readdirSync(cwd);
-        for (const marker of rootMarkers) {
-            if (marker.startsWith("*.")) {
-                const ext = marker.slice(1);
-                if (files.some((f) => f.endsWith(ext))) return true;
-            } else if (files.includes(marker)) {
-                return true;
-            }
+    const existing = clients.get(key);
+    if (existing && existing.running) {
+        return existing;
+    }
+
+    if (starting.has(key)) {
+        return starting.get(key)!;
+    }
+
+    const startPromise = (async () => {
+        const bin = findExecutable(config.command, resolvedCwd);
+        if (!bin) {
+            throw new Error(`Executable for ${config.command} not found in ${resolvedCwd}`);
         }
-    } catch {}
-    return false;
-}
 
-async function startServer(id: string, config: ServerConfig, cwd: string): Promise<ActiveClient> {
-    const localBin = join(cwd, "node_modules", ".bin", config.command);
-    const bin = existsSync(localBin) ? localBin : config.command;
-    const proc = spawn(bin, config.args ?? [], {
-        cwd,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-    });
+        const env = { ...process.env };
+        const binDirs: string[] = [];
+        let p = resolvedCwd;
+        while (true) {
+            const b = join(p, "node_modules", ".bin");
+            if (existsSync(b)) binDirs.push(b);
+            const up = dirname(p);
+            if (up === p) break;
+            p = up;
+        }
+        if (binDirs.length > 0) {
+            env.PATH = `${binDirs.join(delimiter)}${delimiter}${env.PATH || ""}`;
+        }
 
-    const client: ActiveClient = {
-        id,
-        config,
-        process: proc,
-        workspaceRoot: cwd,
-        reqId: 0,
-        pending: new Map(),
-        diagnostics: new Map(),
-        buffer: "",
-    };
+        const proc = spawn(bin, config.args ?? [], {
+            cwd: resolvedCwd,
+            stdio: ["pipe", "pipe", "pipe"],
+            env,
+        });
 
-    proc.stdout?.on("data", (d) => handleLspData(client, d.toString()));
-    proc.on("error", () => {
-        clients.delete(`${id}:${cwd}`);
-    });
-    proc.on("exit", () => {
-        clients.delete(`${id}:${cwd}`);
-    });
+        const client: ActiveClient = {
+            id,
+            config,
+            process: proc,
+            workspaceRoot: resolvedCwd,
+            reqId: 0,
+            pending: new Map(),
+            diagnostics: new Map(),
+            buffer: Buffer.alloc(0),
+            openFiles: new Map(),
+            running: false,
+            stderrTail: "",
+        };
+        clients.set(key, client);
 
-    clients.set(`${id}:${cwd}`, client);
+        const { promise: earlySpawnError, reject: rejectEarlySpawn } = Promise.withResolvers<never>();
 
-    await sendLsp(client, "initialize", {
-        processId: process.pid,
-        rootUri: `file://${cwd}`,
-        capabilities: {},
-        initializationOptions: config.initOptions || {},
-    });
-    notifyLsp(client, "initialized", {});
+        const onEarlyError = (err: Error) => {
+            cleanupEarly(err);
+        };
+        const onEarlyExit = (code: number | null, signal: string | null) => {
+            cleanupEarly(new Error(`LSP server exited before initialization: code=${code}, signal=${signal}${client.stderrTail ? `\n${client.stderrTail}` : ""}`));
+        };
 
-    return client;
-}
+        function cleanupEarly(err: Error) {
+            client.running = false;
+            if (clients.get(key) === client) clients.delete(key);
+            for (const req of client.pending.values()) {
+                clearTimeout(req.timer);
+                req.reject(err);
+            }
+            client.pending.clear();
+            rejectEarlySpawn(err);
+        }
 
-function stopClient(key: string) {
-    const client = clients.get(key);
-    if (client) {
+        proc.once("error", onEarlyError);
+        proc.once("exit", onEarlyExit);
+        const onStreamError = (err: Error) => {
+            cleanupEarly(err);
+            try {
+                proc.kill("SIGKILL");
+            } catch {}
+        };
+        proc.stdin?.on("error", onStreamError);
+        proc.stdout?.on("error", onStreamError);
+        proc.stderr?.on("error", onStreamError);
+
+        proc.stdout?.on("data", (chunk: Buffer) => handleLspData(client, chunk));
+        proc.stderr?.on("data", (chunk: Buffer) => {
+            const text = chunk.toString("utf8");
+            client.stderrTail = (client.stderrTail + text).slice(-10000);
+        });
+
         try {
-            client.process.kill();
-        } catch {}
-        clients.delete(key);
+            const initialized = await Promise.race([
+                sendLsp(client, "initialize", {
+                    processId: process.pid,
+                    rootUri: pathToFileURL(resolvedCwd).href,
+                    workspaceFolders: [
+                        { uri: pathToFileURL(resolvedCwd).href, name: basename(resolvedCwd) },
+                    ],
+                    capabilities: {
+                        textDocument: {
+                            synchronization: {
+                                dynamicRegistration: false,
+                                willSave: false,
+                                willSaveWaitUntil: false,
+                                didSave: false,
+                            },
+                            definition: { dynamicRegistration: false, linkSupport: true },
+                            publishDiagnostics: { relatedInformation: true },
+                        },
+                        workspace: {
+                            configuration: true,
+                            workspaceFolders: true,
+                        },
+                    },
+                    initializationOptions: config.initOptions || {},
+                }),
+                earlySpawnError,
+            ]);
+            if (!isObject(initialized) || !isObject(initialized.capabilities)) {
+                throw new Error(`Invalid initialize response from ${id}`);
+            }
+            if (clients.get(key) !== client || proc.exitCode !== null) {
+                throw new Error(`LSP server ${id} stopped during initialization`);
+            }
+
+            client.running = true;
+            proc.removeListener("error", onEarlyError);
+            proc.removeListener("exit", onEarlyExit);
+
+            proc.on("error", (err) => {
+                client.running = false;
+                if (clients.get(key) === client) {
+                    clients.delete(key);
+                }
+                for (const req of client.pending.values()) {
+                    clearTimeout(req.timer);
+                    req.reject(err);
+                }
+                client.pending.clear();
+            });
+
+            proc.on("exit", (code, signal) => {
+                client.running = false;
+                if (clients.get(key) === client) {
+                    clients.delete(key);
+                }
+                const err = new Error(`LSP server exited: code=${code}, signal=${signal}`);
+                for (const req of client.pending.values()) {
+                    clearTimeout(req.timer);
+                    req.reject(err);
+                }
+                client.pending.clear();
+            });
+
+
+            notifyLsp(client, "initialized", {});
+
+            if (config.settings) {
+                notifyLsp(client, "workspace/didChangeConfiguration", {
+                    settings: config.settings,
+                });
+            }
+
+            return client;
+        } catch (err) {
+            cleanupEarly(err instanceof Error ? err : new Error(String(err)));
+            try {
+                proc.kill("SIGKILL");
+            } catch {}
+            throw err;
+        }
+    })();
+
+    starting.set(key, startPromise);
+    try {
+        return await startPromise;
+    } finally {
+        starting.delete(key);
     }
 }
 
-async function getServersForCwd(cwd: string) {
+export async function stopClient(key: string): Promise<void> {
+    const client = clients.get(key);
+    if (!client) return;
+    clients.delete(key);
+    const wasRunning = client.running;
+    client.running = false;
+
+    for (const req of client.pending.values()) {
+        clearTimeout(req.timer);
+        req.reject(new Error("LSP client stopped"));
+    }
+    client.pending.clear();
+
+    const proc = client.process;
+    if (proc.exitCode !== null || proc.killed) return;
+
+    if (wasRunning) {
+        await sendLsp(client, "shutdown", null, 1000).catch(() => {});
+        notifyLsp(client, "exit", null);
+    }
+
+    if (proc.exitCode === null && !proc.killed) {
+        const { promise, resolve: resolveWait } = Promise.withResolvers<void>();
+        let settled = false;
+        const onExit = () => {
+            if (!settled) {
+                settled = true;
+                resolveWait();
+            }
+        };
+        proc.once("exit", onExit);
+
+        const termTimer = setTimeout(() => {
+            try {
+                proc.kill("SIGTERM");
+            } catch {}
+        }, 500);
+
+        const killTimer = setTimeout(() => {
+            if (!settled) {
+                settled = true;
+                try {
+                    proc.kill("SIGKILL");
+                } catch {}
+                resolveWait();
+            }
+        }, 1500);
+
+        proc.once("exit", () => {
+            clearTimeout(termTimer);
+            clearTimeout(killTimer);
+            onExit();
+        });
+        await promise;
+    }
+}
+
+export async function stopAllClients(): Promise<void> {
+    const allKeys = Array.from(clients.keys());
+    await Promise.allSettled(allKeys.map((key) => stopClient(key)));
+}
+
+export async function getServersForCwd(cwd: string) {
+    if (workspaceScheme(cwd)) {
+        throw new Error(`Remote workspaces are not supported: ${cwd}`);
+    }
+    const resolvedCwd = resolve(cwd);
     return Promise.all(
         Object.entries(LSP_SERVERS).map(async ([id, conf]) => {
-            const available = await isBinaryAvailable(conf.command, cwd);
-            const matched = matchesMarkers(conf.rootMarkers, cwd);
-            const running = Array.from(clients.entries())
-                .filter(([k]) => k.startsWith(`${id}:`))
-                .map(([, c]) => ({
-                    cwd: c.workspaceRoot,
-                    diagnosticsCount: Array.from(c.diagnostics.values()).reduce(
-                        (acc, cur) => acc + cur.length,
-                        0,
-                    ),
-                }));
+            const available = findExecutable(conf.command, resolvedCwd) !== undefined;
+            const matched = matchesMarkersOrExtensions(conf, resolvedCwd);
+            const client = clients.get(`${id}:${resolvedCwd}`);
+            const isRunning = client !== undefined && client.running === true;
+            const instances = isRunning
+                ? [
+                      {
+                          cwd: client.workspaceRoot,
+                          diagnosticsCount: Array.from(client.diagnostics.values()).reduce(
+                              (acc, cur) => acc + cur.length,
+                              0,
+                          ),
+                      },
+                  ]
+                : [];
             return {
                 id,
                 command: conf.command,
@@ -633,37 +1014,123 @@ async function getServersForCwd(cwd: string) {
                 uninstallCmd: conf.uninstallCmd,
                 available,
                 matched,
-                running: running.length > 0,
-                instances: running,
+                running: isRunning,
+                instances,
             };
         }),
     );
+}
+
+function detectLanguageId(filePath: string): string {
+    const ext = extname(filePath).toLowerCase();
+    switch (ext) {
+        case ".ts": return "typescript";
+        case ".tsx": return "typescriptreact";
+        case ".js":
+        case ".mjs":
+        case ".cjs": return "javascript";
+        case ".jsx": return "javascriptreact";
+        case ".json": return "json";
+        case ".rs": return "rust";
+        case ".go": return "go";
+        case ".py": return "python";
+        case ".c":
+        case ".h": return "c";
+        case ".cpp":
+        case ".cc":
+        case ".cxx":
+        case ".hpp": return "cpp";
+        case ".java": return "java";
+        case ".html": return "html";
+        case ".css": return "css";
+        case ".scss": return "scss";
+        case ".md": return "markdown";
+        case ".toml": return "toml";
+        case ".yaml":
+        case ".yml": return "yaml";
+        case ".sh":
+        case ".bash": return "shellscript";
+        default: return "plaintext";
+    }
+}
+
+function syncFileToClient(client: ActiveClient, absPath: string): string {
+    const uri = pathToFileURL(absPath).href;
+    const text = readFileSync(absPath, "utf8");
+    const languageId = detectLanguageId(absPath);
+
+    const previous = client.openFiles.get(uri);
+    if (previous?.text === text) return uri;
+    const version = (previous?.version ?? 0) + 1;
+    client.openFiles.set(uri, { version, text });
+    if (!previous) {
+        notifyLsp(client, "textDocument/didOpen", {
+            textDocument: { uri, languageId, version, text },
+        });
+    } else {
+        notifyLsp(client, "textDocument/didChange", {
+            textDocument: { uri, version },
+            contentChanges: [{ text }],
+        });
+    }
+    return uri;
 }
 
 export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
     if (web) {
         web.client("pi-lsp.js", { access: "owner" });
 
-        // Global fallback
         web.route(
             "GET",
             "servers",
             async (req: WebRequest) => {
                 const cwd = (req.query.get("cwd") as string) || process.cwd();
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
                 const list = await getServersForCwd(cwd);
                 return { servers: list, cwd };
             },
             { access: "owner" },
         );
 
-        // Per-conversation route
         web.conversationRoute(
             "GET",
             "c/:conversation/servers",
             async (req: ConversationWebRequest) => {
                 const cwd = req.conversation.cwd;
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
                 const list = await getServersForCwd(cwd);
                 return { servers: list, cwd };
+            },
+            { conversation: "conversation", access: "owner" },
+        );
+
+        web.conversationRoute(
+            "POST",
+            "c/:conversation/start",
+            async (req: ConversationWebRequest) => {
+                const cwd = req.conversation.cwd;
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
+                const conf = LSP_SERVERS[serverId];
+                if (!conf) throw web.error(404, `Unknown server ${serverId}`);
+                await startServer(serverId, conf, cwd);
+                return { ok: true };
+            },
+            { conversation: "conversation", access: "owner" },
+        );
+
+        web.conversationRoute(
+            "POST",
+            "c/:conversation/stop",
+            async (req: ConversationWebRequest) => {
+                const cwd = req.conversation.cwd;
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
+                const key = `${serverId}:${resolve(cwd)}`;
+                await stopClient(key);
+                return { ok: true };
             },
             { conversation: "conversation", access: "owner" },
         );
@@ -672,9 +1139,12 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             "POST",
             "stop",
             async (req: WebRequest) => {
-                const { serverId, cwd } = (req.body as any) || {};
-                const key = `${serverId}:${cwd || process.cwd()}`;
-                stopClient(key);
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
+                const cwd = typeof body.cwd === "string" ? body.cwd : process.cwd();
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
+                const key = `${serverId}:${resolve(cwd)}`;
+                await stopClient(key);
                 return { ok: true };
             },
             { access: "owner" },
@@ -684,7 +1154,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             "POST",
             "start",
             async (req: WebRequest) => {
-                const { serverId, cwd = process.cwd() } = (req.body as any) || {};
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
+                const cwd = typeof body.cwd === "string" ? body.cwd : process.cwd();
+                if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
                 const conf = LSP_SERVERS[serverId];
                 if (!conf) throw web.error(404, `Unknown server ${serverId}`);
                 await startServer(serverId, conf, cwd);
@@ -697,14 +1170,15 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             "POST",
             "install",
             async (req: WebRequest) => {
-                const { serverId } = (req.body as any) || {};
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.installCmd) throw web.error(400, "No install command available");
                 try {
                     const { stdout, stderr } = await execAsync(conf.installCmd);
                     return { ok: true, output: stdout || stderr };
-                } catch (err: any) {
-                    throw web.error(500, err.message);
+                } catch (err: unknown) {
+                    throw web.error(500, err instanceof Error ? err.message : String(err));
                 }
             },
             { access: "owner" },
@@ -714,23 +1188,21 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             "POST",
             "uninstall",
             async (req: WebRequest) => {
-                const { serverId } = (req.body as any) || {};
+                const body = getRequestBody(req);
+                const serverId = typeof body.serverId === "string" ? body.serverId : "";
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.uninstallCmd) throw web.error(400, "No uninstall command available");
                 try {
                     const { stdout, stderr } = await execAsync(conf.uninstallCmd);
                     return { ok: true, output: stdout || stderr };
-                } catch (err: any) {
-                    throw web.error(500, err.message);
+                } catch (err: unknown) {
+                    throw web.error(500, err instanceof Error ? err.message : String(err));
                 }
             },
             { access: "owner" },
         );
-
-        web.onDispose(() => {
-            for (const key of clients.keys()) {
-                stopClient(key);
-            }
+        web.onDispose(async () => {
+            await stopAllClients();
         });
     }
 
@@ -738,25 +1210,27 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         name: "lsp_status",
         description: "Check status of active and detected Language Servers (LSP) in workspace.",
         parameters: Type.Object({}),
-        async execute(_args, context) {
-            const cwd = process.cwd();
-            const active = Array.from(clients.values()).map((c) => ({
-                id: c.id,
-                command: c.config.command,
-                workspace: c.workspaceRoot,
-                diagnosticsCount: Array.from(c.diagnostics.values()).reduce(
-                    (acc, cur) => acc + cur.length,
-                    0,
-                ),
-            }));
+        async execute(_args, api, context) {
+            const cwd = await getSessionCwd(api, context);
+            const active = Array.from(clients.values())
+                .filter((c) => c.workspaceRoot === cwd && c.running)
+                .map((c) => ({
+                    id: c.id,
+                    command: c.config.command,
+                    workspace: c.workspaceRoot,
+                    diagnosticsCount: Array.from(c.diagnostics.values()).reduce(
+                        (acc, cur) => acc + cur.length,
+                        0,
+                    ),
+                }));
 
             const detected = [];
             for (const [id, conf] of Object.entries(LSP_SERVERS)) {
-                if (matchesMarkers(conf.rootMarkers, cwd)) {
+                if (matchesMarkersOrExtensions(conf, cwd)) {
                     detected.push({
                         id,
                         command: conf.command,
-                        available: await isBinaryAvailable(conf.command, cwd),
+                        available: findExecutable(conf.command, cwd) !== undefined,
                         installCmd: conf.installCmd,
                     });
                 }
@@ -779,14 +1253,25 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         parameters: Type.Object({
             file: Type.Optional(Type.String({ description: "Optional specific file path" })),
         }),
-        async execute(args, context) {
-            const cwd = process.cwd();
-            const matching = Array.from(clients.values()).filter((c) => c.workspaceRoot === cwd);
-            const results: Record<string, any> = {};
+        async execute(args, api, context) {
+            const cwd = await getSessionCwd(api, context);
+            const matching = Array.from(clients.values()).filter((c) => c.workspaceRoot === cwd && c.running);
 
+            if (args.file) {
+                const absPath = args.file.startsWith("/") ? args.file : join(cwd, args.file);
+                for (const c of matching) {
+                    syncFileToClient(c, absPath);
+                }
+            }
+
+            const results: Record<string, unknown> = {};
             for (const c of matching) {
                 for (const [uri, diags] of c.diagnostics.entries()) {
-                    if (!args.file || uri.endsWith(args.file)) {
+                    if (
+                        !args.file ||
+                        uri.endsWith(args.file) ||
+                        uri === pathToFileURL(resolve(cwd, args.file)).href
+                    ) {
                         results[uri] = diags;
                     }
                 }
@@ -812,10 +1297,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             line: Type.Number({ description: "0-based line number" }),
             character: Type.Number({ description: "0-based character offset" }),
         }),
-        async execute(args, context) {
-            const cwd = process.cwd();
+        async execute(args, api, context) {
+            const cwd = await getSessionCwd(api, context);
             let client = clients.get(`${args.server}:${cwd}`);
-            if (!client) {
+            if (!client || !client.running) {
                 const conf = LSP_SERVERS[args.server];
                 if (!conf) {
                     return {
@@ -826,8 +1311,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             }
 
             const absPath = args.file.startsWith("/") ? args.file : join(cwd, args.file);
+            const uri = syncFileToClient(client, absPath);
+
             const res = await sendLsp(client, "textDocument/definition", {
-                textDocument: { uri: `file://${absPath}` },
+                textDocument: { uri },
                 position: { line: args.line, character: args.character },
             });
 
@@ -854,12 +1341,18 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 Type.Literal("uninstall"),
             ]),
         }),
-        async execute(args, context) {
-            const cwd = process.cwd();
+        async execute(args, api, context) {
+            if (args.action === "install" || args.action === "uninstall") {
+                const requester = host.requesterOf(api.conversationId);
+                if (!requester || host.roleOf(requester) !== "owner") {
+                    throw new Error("Only the owner can install or uninstall language servers");
+                }
+            }
+            const cwd = await getSessionCwd(api, context);
             const key = `${args.server}:${cwd}`;
 
             if (args.action === "stop") {
-                stopClient(key);
+                await stopClient(key);
                 return { output: [{ type: "text" as const, text: `Stopped ${args.server}` }] };
             }
 
@@ -874,12 +1367,13 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                     return {
                         output: [{ type: "text" as const, text: `Started ${args.server} for ${cwd}` }],
                     };
-                } catch (err: any) {
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
                     return {
                         output: [
                             {
                                 type: "text" as const,
-                                text: `Failed to start ${args.server}: ${err.message}. Install command: ${conf.installCmd || "none"}`,
+                                text: `Failed to start ${args.server}: ${msg}. Install command: ${conf.installCmd || "none"}`,
                             },
                         ],
                     };
@@ -893,8 +1387,9 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 try {
                     const { stdout, stderr } = await execAsync(conf.installCmd);
                     return { output: [{ type: "text" as const, text: `Installed:\n${stdout || stderr}` }] };
-                } catch (err: any) {
-                    return { output: [{ type: "text" as const, text: `Install failed: ${err.message}` }] };
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    return { output: [{ type: "text" as const, text: `Install failed: ${msg}` }] };
                 }
             }
 
@@ -905,8 +1400,9 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 try {
                     const { stdout, stderr } = await execAsync(conf.uninstallCmd);
                     return { output: [{ type: "text" as const, text: `Uninstalled:\n${stdout || stderr}` }] };
-                } catch (err: any) {
-                    return { output: [{ type: "text" as const, text: `Uninstall failed: ${err.message}` }] };
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    return { output: [{ type: "text" as const, text: `Uninstall failed: ${msg}` }] };
                 }
             }
 
