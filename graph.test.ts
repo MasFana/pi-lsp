@@ -4,8 +4,8 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
-import { GraphProvider } from "./pi-lsp/v1.3.0/graph.ts";
-import { createProcessRunner } from "./pi-lsp/v1.3.0/process.ts";
+import { GraphProvider } from "./pi-lsp/v1.3.1/graph.ts";
+import { createProcessRunner } from "./pi-lsp/v1.3.1/process.ts";
 const find = (command: string) => (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, command)).find((path) => existsSync(path));
 const binary = find("codegraph");
 async function fixture(run: (root: string, graph: GraphProvider, setOwner: (value: boolean) => void) => Promise<void>) {

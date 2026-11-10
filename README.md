@@ -1,8 +1,12 @@
 # Pi Fana Tooling (`pi-lsp`)
 
-Semantic LSP, structural AST and indexed CodeGraph tools for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), with one verified proposal/apply engine and one owner Tooling panel. The installed module remains `pi-lsp`: existing tools, settings, eight legacy routes and all 54 server definitions stay supported. Published via [OMP](https://github.com/MasFana/OMP); source at [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp). No model selector, native read/search wrappers, extra LSP lifecycle, global output hook, MCP registration, or automatic indexing/installing.
+Semantic LSP, structural AST and indexed CodeGraph tools for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), with one verified proposal/apply engine and one owner Tooling panel. The installed module remains `pi-lsp`: existing tools, settings, eight legacy routes and all 54 server definitions stay supported. Published via [OMP](https://github.com/MasFana/OMP); source at [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp). No model selector, native read/search wrappers, extra LSP lifecycle, global output hook or MCP registration. Owner-authorized tool handoff runs without extension confirmation dialogs.
 
 Requires Pi Pocket `>= 0.28.0` (`pocketApi = 2`), Node `>= 22.19.0` (native TypeScript execution), and `Type` imported directly from `typebox`.
+
+### Release 1.3.1
+
+Removes all extension review/consent gates, permission dialogs and confirmation tokens. `fana_apply` executes task-authorized proposals and commands directly; the agent inspects previews itself. `lsp_manage` also manages `ast-grep` and `codegraph`, including index create/sync/rebuild, so handoff does not stop at a manual panel. Owner checks, stale-file guards, automatic diagnostics and uncertain-command recovery remain. Native Pocket Plan/approval policies are unchanged.
 
 ### Release 1.3.0
 
@@ -19,13 +23,13 @@ Adds semantic query/previews, one AST provider, read-only CodeGraph queries and 
 4. Updates never apply automatically: review diffs and apply updates in the **Updates** tab.
 
 ### Manual Drop-in & Reload
-Copy `pi-lsp.ts`, `pi-lsp.js` and the entire `pi-lsp/v1.3.0/` helper directory into Pocket's `extensions/`. Do not copy dependencies, tests or linked `_pocket.d.ts`. Enable `pi-lsp.ts` in **Menu → Extensions**. Reload after replacing the bundle. Gallery releases change the helper-directory version so native transitive imports receive new addresses; editing an existing helper version manually requires a server restart. Do not add a second file watcher or loader hook.
+Copy `pi-lsp.ts`, `pi-lsp.js` and the entire `pi-lsp/v1.3.1/` helper directory into Pocket's `extensions/`. Do not copy dependencies, tests or linked `_pocket.d.ts`. Enable `pi-lsp.ts` in **Menu → Extensions**. Reload after replacing the bundle. Gallery releases change helper-directory versions to invalidate native import caches; editing an existing helper version manually requires a server restart. No second watcher/loader hook is added.
 
 ## Architecture & Lifecycle
 
 - **Workspace authority:** CWD comes from Durable execution context and is canonicalized. Remote workspaces are rejected. New provider queries and proposals enforce local containment, including symlink targets; graph queries never borrow an index from an unauthorized parent/worktree.
 - **Executable Lookup**: `findExecutable` checks relative paths against CWD, walks upward through ancestor `node_modules/.bin` directories to the root, then scans system `PATH` (incorporating `PATHEXT` on Windows). Projects detect via upward `rootMarkers` or source file extensions (`fileTypes`).
-- **Stdio RPC:** JSON-RPC 2.0 uses UTF-8 byte-length framing and isolated client/server request IDs. Unsupported requests receive `-32601`; `workspace/applyEdit` is accepted only during an explicitly owner-confirmed command and passes through the proposal engine. Initialization advertises UTF-16 positions, text edits and no resource operations.
+- **Stdio RPC:** JSON-RPC 2.0 uses UTF-8 byte-length framing and isolated client/server request IDs. Unsupported requests receive `-32601`; `workspace/applyEdit` is accepted during an owner-authorized command and passes through the proposal engine. Initialization advertises UTF-16 positions, text edits and no resource operations.
 - **One lifecycle:** One LSP process per canonical `${server}:${workspaceRoot}`; concurrent starts share initialization. Requests time out after 10 seconds. Stop sends `shutdown`/`exit`, then escalates termination within about 2.5 seconds. LSP, CLI workers and legacy installers share a single disposal window; provider workers stop in parallel, not in a second sequential lifecycle.
 - **File Sync & Diagnostics**: Encoded file URIs handle Unicode, spaces and `#`. First sync sends `didOpen`; changed text sends versioned `didChange`, invalidates the old cache, and avoids re-sending unchanged text. File checks wait up to 5 seconds for a valid current report: push diagnostics or advertised pull diagnostics. Older versioned reports are discarded; malformed/unchanged pull reports and timeouts are errors, never an empty “clean” result. Unversioned push reports cannot prove an exact document version.
 
@@ -51,7 +55,7 @@ Copy `pi-lsp.ts`, `pi-lsp.js` and the entire `pi-lsp/v1.3.0/` helper directory i
 | `lsp_query` | `action`, optional file/server/position/query/kinds/formatting options, `maxResults`, code-action `offset` | `readOnlyHint: true`, safe replay | Owner-only semantic queries and immutable rename/format/code-action previews. No source writes. |
 | `fana_ast` | `action`, explicit `paths`, optional lang/pattern/rule/ops and limits | `readOnlyHint: true`, safe replay | Cached status, structural search/outline or sequential rewrite preview. Every subprocess invocation requires owner authority. |
 | `fana_graph` | `action`, query/symbol/file, bounded depth/results and generation | `readOnlyHint: true`, safe replay | Cached status or owner-only existing-index queries. Never initializes or syncs as a query side effect. |
-| `fana_apply` | `proposalId` | Unsafe replay | Applies exact saved edits; rejects stale content and reports per-file mutation/verification outcomes. Commands require explicit owner-panel confirmation. |
+| `fana_apply` | `proposalId` | Unsafe replay | Immediately applies the authorized saved proposal, including commands. No separate human review/consent gate. Stale-file checks and per-file mutation/verification outcomes remain. |
 
 `readOnlyHint` classifies filesystem effects for Plan mode; it is not authorization or an OS sandbox. Status and cached no-file diagnostics remain inspectable by permitted session participants; starting/stopping or synchronizing file data does not.
 
@@ -71,7 +75,7 @@ Graph status separates installation, index existence/build state, extraction-eng
 - UTF-8 AST offsets and UTF-16 LSP positions are normalized, including Unicode and CRLF. Overlap, ambiguous edits, stale bytes, changed paths, `.env*` and outside destinations fail before writes.
 - Files are replaced atomically where feasible, preserving modes. Cross-file transactional rollback is not claimed. Durable intent/receipts permit reconciliation of interrupted or partially applied proposals; a task memo is not a filesystem transaction.
 - Resource operations and change annotations are explicitly unsupported, never silently dropped. The server is not advertised support for them.
-- Code-action edits retain their exact server contract. An edit-plus-command action applies its edit first; server-reported follow-up edits use the same engine. Non-previewable commands require human owner consent; unreported command effects are not claimed verified. Uncertain command outcomes are not automatically repeated.
+- Code-action edits retain their exact server contract. Edit-plus-command actions apply the edit first; server follow-up edits use the same engine. Commands run under the owner task's authorization, without a permission popup. Unreported effects are not claimed verified; uncertain outcomes are not blindly repeated, and completed commands are not rerun.
 - Storage uses versioned `x.pi-lsp.*` documents, with one-hour proposal expiry, a 20-record/16-MiB bound and retirement of older completed proposals when capacity is needed. Per-file applied outcomes remain truthful even if receipt persistence fails after writing.
 - New tools preserve full bounded structured results for Durable nested callers. Model-facing JSON is fenced as untrusted data and has a 32-KiB display budget; larger displays return explicit truncation/count/proposal metadata rather than broken JSON. Immutable edit bytes are not clipped.
 
@@ -97,16 +101,15 @@ Paths are relative to `/api/x/pi-lsp/`. Every method requires owner access and `
 - `POST start` / `POST stop`: Starts/stops server for explicit CWD (`{ serverId, cwd }`).
 - `POST install` / `POST uninstall`: Executes catalog package command (`{ serverId }`).
 - `GET tooling/status` / `GET c/:conversation/tooling/status`: Cached combined status and pending proposals. No executable probes, source scans, server starts or indexing on open/poll.
-- `POST tooling/prepare` / `POST c/:conversation/tooling/prepare`: Returns a short-lived owner/workspace/action-bound confirmation with exact command or SDK action, bounded apply diff, scope and unsandboxed warning.
-- `POST tooling/execute` / `POST c/:conversation/tooling/execute`: Consumes `{token, confirmed:true}` once and awaits the operation. Navigation/disconnection may cancel it. Indexing failure/partial state is not returned as success.
+- `POST tooling/execute` / `POST c/:conversation/tooling/execute`: Direct owner operation `{provider, action, serverId?, proposalId?}`. No token/confirmation round trip. Obsolete prepare routes are removed. Navigation/disconnection can cancel operations; partial/failed indexing stays explicit.
 
 New provider installation is offered only after explicit detection finds it missing and a compatible package runtime exists. Uninstall requires a selected executable verified beneath the current `npm root -g`; system/standalone/workspace-local installations are not removed by guessing. Global provenance is rechecked before uninstall. Global package effects are serialized and cannot race an owned index build; no second scheduler is introduced. Installers and all 54 catalog distributions remain unverified across platforms.
 
 ### Browser Dashboard UI
 - One owner sheet with **Overview / LSP / AST / CodeGraph** tabs, native menu and launcher registrations.
 - LSP retains Detected / Running / All filters; unknown detection displays **Not checked**, not falsely missing.
-- One combined badge refreshes on conversation changes and the existing `lsp-changed` event. Fifteen-second polling reads cached snapshots only. Explicit Refresh requires confirmation; opening the panel never starts heavy work.
-- Confirmation starts unchecked, shows the exact action/scope and bounded proposal diff, expires after two minutes, prevents duplicate execution and is cancelled by navigation/workspace changes. All handles, requests, listeners and timers are disposed.
+- One combined badge refreshes on conversation changes and `lsp-changed`. Fifteen-second polling reads cached snapshots only; Refresh runs directly with no permission dialog.
+- Panel operations run immediately under the owner role. Requests are cancelled on navigation/workspace changes; all handles, listeners and timers are disposed. The agent can use `lsp_manage` for the same provider operations without opening the panel.
 
 ### Tool-call presentations
 The owner browser registers `pocket.toolCall` for all eight tools, with bounded subjects, code icons, readable action labels and group summaries. Malformed historical arguments degrade safely. Displayed positions are human 1-based; LSP inputs stay 0-based UTF-16. These are call presentations, not a second editor, model selector or arbitrary result renderer.
@@ -136,7 +139,7 @@ Testing requires a sibling `pi-pocket` checkout with installed dependencies. Run
 node --test pi-lsp/pi-lsp.test.ts pi-lsp/proposals.test.ts pi-lsp/ast.test.ts pi-lsp/graph.test.ts pi-lsp/tooling.test.ts
 ```
 
-The suite exercises protocol/lifecycle compatibility, owner boundaries, Unicode/CRLF, stale/overlapping proposals, interrupted recovery and receipt failures, actual AST operations, actual CodeGraph indexing/query/freshness/generation behavior, and a real Pocket/stdio edit-plus-command consent flow. Real-provider tests require installed compatible CLIs; no test installs packages. A real Pocket smoke also exercised all semantic queries, multi-file rename, AST deletion, formatting, native edit diagnostics, explicit owner indexing, native codemode composition, header/guest denial and all four browser tabs. Only Linux was exercised; package installation/uninstallation was not run.
+The suite exercises protocol/lifecycle compatibility, owner boundaries, Unicode/CRLF, stale/overlapping proposals, interrupted recovery and receipt failures, actual AST and CodeGraph operations, and a real Pocket/stdio edit-plus-command automatic handoff. Owner execution is direct; guests remain denied. Real-provider tests require installed compatible CLIs; no test installs packages. Only Linux was exercised.
 
 Measured enabled-extension overhead in that direct-tool smoke: **4,283 schema/description characters + 1,572 prompt-section characters**, with eight tool definitions. These are characters, not billed tokens; Pocket's baseline 14,000-character regression excludes native Pi tools/drop-ins and is not a global extension cap. Native codemode continues to control its own declarations/output limits.
 
@@ -144,10 +147,10 @@ Measured enabled-extension overhead in that direct-tool smoke: **4,283 schema/de
 
 1. Verify tests pass, then commit and push source to [MasFana/pi-lsp](https://github.com/MasFana/pi-lsp).
 2. In `OMP/entries/pi-lsp.json`:
-   - Set the release version and minimum for APIs actually used (this release: `1.3.0`, Pocket `0.28.0`, API 2).
+   - Set the release version and minimum for APIs actually used (this release: `1.3.1`, Pocket `0.28.0`, API 2).
    - Pin the pushed full source commit; never pin working-tree bytes to the older release.
-   - Hash and size both root files and all eight `pi-lsp/v1.3.0/` helper/worker files. A release helper-directory version change is the native-cache-safe upgrade boundary.
-   - Match eight tools/five read-only hints, `sections: ["lsp_workflow", "fana_routing"]`, `hooks: ["afterTool"]`, owner client/access, eight old routes and six new Tooling routes.
+   - Hash/size both root files and all eight `pi-lsp/v1.3.1/` helper/worker files; the directory version is the native-cache-safe upgrade boundary.
+   - Match eight tools/five read-only hints, two prompt sections, `afterTool`, owner client/access, eight legacy routes and four Tooling routes.
 3. From `OMP/`, fetch and validate the **published** files, then build the index:
    ```sh
    node scripts/validate.ts --pocket ../pi-pocket --only pi-lsp
@@ -164,5 +167,5 @@ Measured enabled-extension overhead in that direct-tool smoke: **4,283 schema/de
 - **Server not starting:** Check executable permissions and ancestor `node_modules/.bin`/`PATH`, required runtimes, stderr/startup errors, and LSP protocol support. An available executable is not proof of successful initialization.
 - **No automatic report:** Check `autoCheck`, caller role, edit success/cancellation, local workspace containment and recognized extension. Shell/external-editor writes are not watched. For a supported file, request `lsp_diagnostics` explicitly; missing binaries, initialization failures and diagnostic timeouts mean **not verified**, not clean. Without `file`, diagnostics are cached received results only.
 - **Provider installed but unavailable:** Check compatibility separately from installation. CodeGraph currently requires verified 1.6.2 and a compatible provider runtime; ast-grep requires verified stable CLI features. Missing indexes are not created by queries.
-- **Stale/ambiguous graph:** Refresh explicitly, or sync/rebuild through owner confirmation. Select a returned symbol ID with its generation. Switch the native session CWD to the authorized repository root when its index is outside the current source-folder workspace.
+- **Stale/ambiguous graph:** The agent can refresh/sync/rebuild through `lsp_manage` with server `codegraph`, without human consent. Queries themselves remain read-only. Select symbol IDs with their generation; use the native session CWD to authorize the repository containing the index.
 - **Proposal rejected:** Regenerate after changed bytes/versions/paths. Pending proposal capacity, expiry or a previously uncertain command outcome is explicit; do not blindly repeat commands.

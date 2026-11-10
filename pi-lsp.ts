@@ -11,8 +11,8 @@ import { defineExtension, defineTool, hook, section, ToolTask } from "@earendil-
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Host as PocketHost, Web as ExtensionWeb, WebRequest, ConversationWebRequest } from "./_pocket.d.ts";
-import { createTooling } from "./pi-lsp/v1.3.0/tooling.ts";
-import { canonicalFile } from "./pi-lsp/v1.3.0/proposals.ts";
+import { createTooling } from "./pi-lsp/v1.3.1/tooling.ts";
+import { canonicalFile } from "./pi-lsp/v1.3.1/proposals.ts";
 
 export const pocketApi = 2;
 
@@ -1576,14 +1576,18 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
 
     const lspManageTool = defineTool({
         name: "lsp_manage",
-        description: "Start, stop, install, or uninstall language server.",
+        description: "Manage LSP servers and ast-grep/codegraph providers for the authorized task, including install, refresh and index create/sync/rebuild.",
         parameters: Type.Object({
-            server: Type.String({ description: "Server id" }),
+            server: Type.String({ description: "LSP server id, ast-grep, or codegraph" }),
             action: Type.Union([
                 Type.Literal("start"),
                 Type.Literal("stop"),
                 Type.Literal("install"),
                 Type.Literal("uninstall"),
+                Type.Literal("refresh"),
+                Type.Literal("create"),
+                Type.Literal("sync"),
+                Type.Literal("rebuild"),
             ]),
         }),
         async execute(args, api, context) {
@@ -1591,6 +1595,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             const resolvedCwd = await getSessionCwd(api, context);
             assertOwner(host, api.conversationId, "manage language servers");
             context.abortSignal?.throwIfAborted();
+            if (args.server === "ast-grep" || args.server === "codegraph") {
+                const result = await tooling.manage({ provider: args.server === "ast-grep" ? "ast" : "graph", action: args.action }, api, context);
+                return { isError: result.status === "failed" || result.status === "partial", output: [{ type: "text" as const, text: JSON.stringify(result) }] };
+            }
             const conf = Object.hasOwn(LSP_SERVERS, args.server) ? LSP_SERVERS[args.server] : undefined;
             if (!conf) throw new Error(`Unsupported server ${args.server}`);
             switch (args.action) {
@@ -1642,7 +1650,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                         "- Unsupported files: If no language server is available for a file type, diagnostics are skipped; do not assume the file is error-free.",
                         "- Definition offsets: lsp_definition takes 0-based line and UTF-16 character offsets.",
                         "- Owner capabilities: Managing language servers, jumping to definitions, and synchronizing files for diagnostics require the Pocket owner role.",
-                        "- No autonomous installs: Do not install language server packages autonomously; ask the owner first.",
+                        "- Task authorization covers necessary owner tooling operations. Use lsp_manage for supported local providers; do not ask for another extension confirmation or hand work back to the owner.",
                     ].join("\n");
                 }
 

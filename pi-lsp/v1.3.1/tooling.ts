@@ -23,9 +23,8 @@ interface Scope {
     owner(): void; snapshot: DocumentReader["snapshot"];
     commit<T>(change: (tx: Tx) => T | Promise<T>): Promise<T>;
 }
-interface Confirmation {
-    token: string; cwd: string; conversationId: string; requesterId: string; expiresAt: number;
-    provider: "lsp" | "ast" | "graph"; action: string; serverId?: string; proposalId?: string; command: string; title: string;
+interface Operation {
+    provider: "lsp" | "ast" | "graph"; action: string; serverId?: string; proposalId?: string; command: string;
     npmRoot?: string;
 }
 const resultSchema = Type.Object({ status: Type.String() }, { additionalProperties: true });
@@ -37,7 +36,6 @@ const object = (value: unknown): value is Record<string, unknown> => value !== n
 
 export function createTooling(host: Host, web: Web | undefined, bridge: LspBridge & { refreshServers(cwd: string): Promise<unknown[]>; version(cwd: string, file: string, server?: string): number | undefined }) {
     const processes = createProcessRunner();
-    const confirmations = new Map<string, Confirmation>();
     const busy = new Map<string, { id: string; action: string }>();
     const managedExecutables = new Map<string, string>();
     const ownerFor = (id: string) => { if (host.roleOf(id) !== "owner") throw new Error("Only the Pocket owner can execute tooling operations"); };
@@ -122,7 +120,7 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         for (const id of index?.ids ?? []) {
             const doc = await scope.snapshot(ProposalDoc, id, scope.context);
             const p = doc?.value as unknown as Proposal | undefined;
-            if (p && p.expiresAt > Date.now() && p.workspace === scope.cwd && p.requesterId === scope.requesterId && p.conversationId === scope.conversationId && (p.files.some((f) => f.receipt.status !== "applied") || p.command && p.commandReceipt?.status !== "completed")) rows.push({ id: p.id, title: p.title, files: p.files.map((f) => f.file), requiresConsent: !!p.command });
+            if (p && p.expiresAt > Date.now() && p.workspace === scope.cwd && p.requesterId === scope.requesterId && p.conversationId === scope.conversationId && (p.files.some((f) => f.receipt.status !== "applied") || p.command && p.commandReceipt?.status !== "completed")) rows.push({ id: p.id, title: p.title, files: p.files.map((f) => f.file), hasCommand: !!p.command });
         }
         return rows;
     };
@@ -177,10 +175,10 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         }
         return results;
     };
-    const apply = async (scope: Scope, id: string, consent = false) => {
+    const apply = async (scope: Scope, id: string) => {
         scope.owner();
         const proposal = await read(scope, id);
-        if (proposal.command && !consent) throw new Error("This code action requires explicit owner confirmation in the Tooling panel");
+        if (proposal.commandReceipt?.status === "completed") return { status: "already_applied", changedFiles: [], files: proposal.files.map((file) => ({ file: file.file, status: "already_applied" })), command: proposal.commandReceipt, verification: [], message: "Proposal and command already completed; no effects repeated" };
         if (proposal.commandReceipt?.status === "running" || proposal.commandReceipt?.status === "interrupted") throw new Error("Command outcome is uncertain; request a new action proposal before executing again");
         let client: Awaited<ReturnType<LspBridge["select"]>> | undefined;
         if (proposal.command) {
@@ -191,7 +189,7 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         }
         const outcome = await applyProposal(proposal, { assertOwner: scope.owner, save: (p) => save(scope, p), signal: scope.signal, getVersion: (file) => bridge.version(scope.cwd, file, proposal.server) });
         const files = new Set(outcome.changedFiles);
-        if (proposal.command && client && ["applied", "already_applied"].includes(outcome.status) && proposal.commandReceipt?.status !== "completed") {
+        if (proposal.command && client && ["applied", "already_applied"].includes(outcome.status)) {
             scope.owner();
             for (const file of files) bridge.sync(client, file);
             proposal.commandReceipt = { status: "running" };
@@ -218,7 +216,7 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         const structuredOutput = json(value);
         let display = JSON.stringify(structuredOutput);
         if (Buffer.byteLength(display) > 32_000) {
-            const shortProposal = (item: unknown) => object(item) ? { id: item.id, title: typeof item.title === "string" ? item.title.slice(0, 300) : undefined, requiresCommand: item.requiresCommand, changedFileCount: Array.isArray(item.changedFiles) ? item.changedFiles.length : undefined } : undefined;
+            const shortProposal = (item: unknown) => object(item) ? { id: item.id, title: typeof item.title === "string" ? item.title.slice(0, 300) : undefined, hasCommand: item.hasCommand, changedFileCount: Array.isArray(item.changedFiles) ? item.changedFiles.length : undefined } : undefined;
             display = JSON.stringify({ status: structuredOutput.status, truncated: true, displayOnly: true, total: structuredOutput.total, message: "Display byte budget exceeded; narrow the query or preview fewer files. Full structured output and immutable proposal bytes are retained.", proposal: shortProposal(structuredOutput.proposal), proposals: Array.isArray(structuredOutput.proposals) ? structuredOutput.proposals.slice(0, 20).map(shortProposal) : undefined, changedFileCount: Array.isArray(structuredOutput.changedFiles) ? structuredOutput.changedFiles.length : undefined });
         }
         return { structuredOutput, output: [{ type: "text" as const, text: `<tooling_data>\n${host.text.defang(display)}\n</tooling_data>` }] };
@@ -265,7 +263,7 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
             if (args.action === "status") return modelResult({ status: "ok", ...management(graph.cachedStatus(scope.cwd)) });
             scope.owner(); const result = await graph.query(scope.cwd, args as GraphQuery, scope.signal); scope.owner(); changed(scope.cwd, []); return modelResult(result);
         } });
-    const fanaApply = defineTool({ name: "fana_apply", description: "Apply an exact preview proposal ID after review. Rejects stale files; reports changed files and verification separately.", replay: "unsafe" as const,
+    const fanaApply = defineTool({ name: "fana_apply", description: "Immediately apply the exact saved proposal for the authorized task. No extra human review or consent; stale-file and recovery guards remain.", replay: "unsafe" as const,
         parameters: Type.Object({ proposalId: Type.String() }, { additionalProperties: false }), structuredOutputSchema: resultSchema,
         async execute(args, api, context) { const scope = await toolScope(api, context); return modelResult(await apply(scope, args.proposalId)); } });
     for (const tool of [lspQuery, fanaAst, fanaGraph]) Object.assign(tool, { annotations: { readOnlyHint: true } });
@@ -283,7 +281,7 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
             return result;
         } finally { busy.delete("<global-command>"); changed(cwd, []); }
     };
-    const prepare = async (scope: Scope, body: Record<string, unknown>) => {
+    const resolveOperation = async (scope: Scope, body: Record<string, unknown>): Promise<Operation> => {
         scope.owner();
         const provider = body.provider;
         const action = typeof body.action === "string" ? body.action : "";
@@ -291,47 +289,43 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         const serverId = typeof body.serverId === "string" ? body.serverId : undefined;
         const proposalId = typeof body.proposalId === "string" ? body.proposalId : undefined;
         const { ast, graph } = providers(scope);
-        let command = "", title = `${action} ${provider}`;
-        let preview: ReturnType<typeof summarizeProposal>["diffs"] | undefined;
-        if (action === "apply") { if (!proposalId) throw new Error("proposalId required"); const p = await read(scope, proposalId); title = p.title; preview = summarizeProposal(p).diffs; command = p.command ? `Apply ${p.files.length} reviewed file changes, then ${p.command.server}: ${p.command.command}` : `Apply ${p.files.length} reviewed file changes`; }
-        else if (action === "refresh") command = `Refresh ${provider} metadata in ${scope.cwd}`;
-        else if (["create", "sync", "rebuild"].includes(action)) { if (provider !== "graph") throw new Error("Index operations require CodeGraph"); command = `CodeGraph SDK ${action}(${scope.cwd}); no watcher or Git hooks`; }
+        let command = "";
+        if (action === "apply") { if (!proposalId) throw new Error("proposalId required"); await read(scope, proposalId); }
+        else if (action === "refresh") { /* No command is needed for status refresh. */ }
+        else if (["create", "sync", "rebuild"].includes(action)) { if (provider !== "graph") throw new Error("Index operations require CodeGraph"); }
         else if (provider === "lsp") {
             const conf = serverId ? bridge.config(serverId) : undefined;
             command = (action === "install" ? conf?.installCmd : conf?.uninstallCmd) ?? "";
             if (!command) throw new Error("No supported server command");
         } else {
+            if (provider === "ast" && ast.cachedStatus(scope.cwd).checkedAt === undefined) await ast.probe(scope.cwd, scope.signal);
+            if (provider === "graph" && graph.cachedStatus(scope.cwd).checkedAt === undefined) await graph.probe(scope.cwd, scope.signal);
+            if (action === "uninstall") await inspectNpmOwnership(scope);
             const cached = provider === "ast" ? ast.cachedStatus(scope.cwd) : graph.cachedStatus(scope.cwd);
             const capabilities = management(cached);
             if (action === "uninstall" && !capabilities.canUninstall) throw new Error("Installation provenance is not extension-manageable");
             if (action === "install" && !capabilities.canInstall) throw new Error("No compatible package-install runtime is available");
             command = `npm ${action === "install" ? "install" : "uninstall"} -g ${provider === "ast" ? "@ast-grep/cli" : "@colbymchenry/codegraph"}${action === "install" && provider === "graph" ? "@1.6.2" : ""}`;
         }
-        const token = randomUUID(), expiresAt = Date.now() + 120_000;
-        for (const [key, old] of confirmations) if (old.expiresAt < Date.now()) confirmations.delete(key);
-        if (confirmations.size >= 100) throw new Error("Confirmation limit reached");
         const selected = provider === "ast" ? ast.cachedStatus(scope.cwd) : graph.cachedStatus(scope.cwd);
-        confirmations.set(token, { token, cwd: scope.cwd, conversationId: scope.conversationId, requesterId: scope.requesterId, provider: provider as Confirmation["provider"], action, serverId, proposalId, command, title, expiresAt, npmRoot: action === "uninstall" && provider !== "lsp" && selected.executable ? managedExecutables.get(selected.executable) : undefined });
-        return { token, title, command, preview, npmRoot: confirmations.get(token)?.npmRoot, expiresAt, warning: "Provider executables, installers and server commands run unsandboxed with the server account's filesystem/network rights. Indexing is explicit; no watcher or Git hooks will be installed." };
+        return { provider: provider as Operation["provider"], action, serverId, proposalId, command, npmRoot: action === "uninstall" && provider !== "lsp" && selected.executable ? managedExecutables.get(selected.executable) : undefined };
     };
     const execute = async (scope: Scope, body: Record<string, unknown>) => {
         scope.owner();
-        const token = typeof body.token === "string" ? body.token : "";
-        const plan = confirmations.get(token);
-        if (!plan || body.confirmed !== true || plan.expiresAt < Date.now() || plan.cwd !== scope.cwd || plan.conversationId !== scope.conversationId || plan.requesterId !== scope.requesterId) throw new Error("Confirmation is absent, expired or belongs to another workspace/person");
+        const plan = await resolveOperation(scope, body);
         if (busy.has(scope.cwd) || busy.has("<global-command>")) throw new Error("Another tooling/package operation is running");
-        confirmations.delete(token); busy.set(scope.cwd, { id: token, action: plan.action }); changed(scope.cwd, []);
+        busy.set(scope.cwd, { id: randomUUID(), action: plan.action }); changed(scope.cwd, []);
         const { ast, graph } = providers(scope);
         let providerOutcome: ProviderStatus | undefined;
         try {
-            if (plan.action === "apply") return await apply(scope, plan.proposalId!, true);
+            if (plan.action === "apply") return await apply(scope, plan.proposalId!);
             if (plan.action === "refresh") {
                 if (plan.provider === "lsp") await bridge.refreshServers(scope.cwd);
                 else if (plan.provider === "ast") providerOutcome = await ast.probe(scope.cwd, scope.signal);
                 else providerOutcome = await graph.operate(scope.cwd, { action: "refresh" }, scope.signal);
             } else if (["create", "sync", "rebuild"].includes(plan.action)) providerOutcome = await graph.operate(scope.cwd, { action: plan.action as "create" | "sync" | "rebuild" }, scope.signal);
             else {
-                if (plan.action === "uninstall" && plan.provider !== "lsp" && (!plan.npmRoot || await inspectNpmOwnership(scope) !== plan.npmRoot)) throw new Error("Global package provenance changed; refresh and confirm again");
+                if (plan.action === "uninstall" && plan.provider !== "lsp" && (!plan.npmRoot || await inspectNpmOwnership(scope) !== plan.npmRoot)) throw new Error("Global package provenance changed; refresh and retry");
                 let failure: Error | undefined;
                 try { await runCommand(plan.command, scope.cwd, scope.signal, scope.owner); }
                 catch (error) { failure = error instanceof Error ? error : new Error(String(error)); }
@@ -352,12 +346,10 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
         };
         web.route("GET", "tooling/status", handle((scope) => status(scope)), { access: "owner" });
         web.conversationRoute("GET", "c/:conversation/tooling/status", handle((scope) => status(scope)), { conversation: "conversation", access: "owner" });
-        for (const [path, fn] of [["prepare", prepare], ["execute", execute]] as const) {
-            web.route("POST", `tooling/${path}`, handle(fn), { access: "owner" });
-            web.conversationRoute("POST", `c/:conversation/tooling/${path}`, handle(fn), { conversation: "conversation", access: "owner" });
-        }
+        web.route("POST", "tooling/execute", handle(execute), { access: "owner" });
+        web.conversationRoute("POST", "c/:conversation/tooling/execute", handle(execute), { conversation: "conversation", access: "owner" });
     }
-    return { tools: [lspQuery, fanaAst, fanaGraph, fanaApply], changed, runCommand, dispose: async () => { confirmations.clear(); await processes.dispose(); },
+    return { tools: [lspQuery, fanaAst, fanaGraph, fanaApply], changed, runCommand, manage: async (body: Record<string, unknown>, api: ToolExecutionApi, context: Context) => execute(await toolScope(api, context), body), dispose: async () => { await processes.dispose(); },
         sections: [section("fana_routing", (input) => {
             const available = [...input.agent.tools, ...input.agent.callable].map((tool) => tool.name);
             const requester = host.requesterOf(input.conversationId);
@@ -365,8 +357,8 @@ export function createTooling(host: Host, web: Web | undefined, bridge: LspBridg
             const lines = [];
             if (available.includes("lsp_query")) lines.push("LSP for semantic references/types/symbols and rename/format/code-action previews.");
             if (available.includes("fana_ast")) lines.push("AST for syntax shapes, outline and structural rewrite previews; not textual symbol rename.");
-            if (available.includes("fana_graph")) lines.push("CodeGraph for existing-index architecture/callers/callees/impact; indexed coverage may be stale or incomplete. Never auto-index.");
-            if (available.includes("fana_apply")) lines.push("Review a proposal, then apply its exact ID. Changed files and diagnostics are separate outcomes; run relevant tests/runtime checks. Commands require owner-panel consent.");
+            if (available.includes("fana_graph")) lines.push("CodeGraph for indexed architecture/callers/callees/impact; use lsp_manage with server codegraph to create/sync an index when needed for the task.");
+            if (available.includes("fana_apply")) lines.push("For requested changes, generate a preview, inspect it yourself and immediately apply its exact ID with fana_apply. Do not ask for extra human review/consent. Automatic diagnostics follow edits; use results and run relevant tests/runtime checks. lsp_manage supports ast-grep and codegraph provider management for autonomous handoff.");
             return lines.length ? lines.join("\n") : undefined;
         })] };
 }

@@ -1,4 +1,4 @@
-// One cached Tooling dashboard; provider operations require an exact owner confirmation.
+// One cached Tooling dashboard; owner actions execute directly without plugin confirmation dialogs.
 export const pocketApi = 2;
 
 const CODE_ICON_PATH = "M16 18l6-6-6-6 M8 6l-6 6 6 6";
@@ -99,13 +99,10 @@ export default function setup(pocket) {
         const [error, setError] = useState("");
         const [actionError, setActionError] = useState("");
         const [outcome, setOutcome] = useState("");
-        const [confirmation, setConfirmation] = useState(null);
-        const [consented, setConsented] = useState(false);
-        const [clock, setClock] = useState(Date.now());
         const [conversationId, setConversationId] = useState(pocket.conversationId());
         const [refresh, setRefresh] = useState(0);
         const operation = useRef(null);
-        const plan = useRef(null);
+        const operationWorkspace = useRef("");
         const loadedFor = useRef(undefined);
         const owner = isOwner();
         const cwd = safeStr(snapshot?.cwd);
@@ -115,9 +112,7 @@ export default function setup(pocket) {
                 operation.current?.abort();
                 if (operation.current) controllers.delete(operation.current);
                 operation.current = null;
-                plan.current = null;
-                setConfirmation(null);
-                setConsented(false);
+                operationWorkspace.current = "";
                 setBusy("");
             };
             const navigation = () => { cancel(); setRefresh((value) => value + 1); };
@@ -142,15 +137,13 @@ export default function setup(pocket) {
         }, [conversationId]);
 
         useEffect(() => {
-            if (!plan.current || plan.current.cwd === cwd) return;
+            if (!operation.current || operationWorkspace.current === cwd) return;
             operation.current?.abort();
             if (operation.current) controllers.delete(operation.current);
             operation.current = null;
-            plan.current = null;
-            setConfirmation(null);
-            setConsented(false);
+            operationWorkspace.current = "";
             setBusy("");
-            setActionError("Workspace changed; prepare a new confirmation before executing.");
+            setActionError("Workspace changed; operation cancelled.");
         }, [cwd]);
 
         useEffect(() => {
@@ -204,21 +197,16 @@ export default function setup(pocket) {
             });
         }, [conversationId, refresh]);
 
-        useEffect(() => {
-            if (!confirmation) return;
-            setClock(Date.now());
-            const interval = setInterval(() => setClock(Date.now()), 1000);
-            return ownCleanup(() => clearInterval(interval));
-        }, [confirmation]);
 
         const current = (stop) => !disposed && !stop.signal.aborted
             && pocket.conversationId() === conversationId && operation.current === stop;
-        const locked = Boolean(busy || confirmation || snapshot?.busy || error || loading);
+        const locked = Boolean(busy || snapshot?.busy || error || loading);
         const startOperation = (label) => {
-            if (!isOwner() || !cwd || error || operation.current || plan.current || snapshot?.busy
+            if (!isOwner() || !cwd || error || operation.current || snapshot?.busy
                 || pocket.conversationId() !== conversationId || disposed) return null;
             const stop = newController();
             operation.current = stop;
+            operationWorkspace.current = cwd;
             setBusy(label);
             setActionError("");
             setOutcome("");
@@ -238,60 +226,18 @@ export default function setup(pocket) {
             setRefresh((value) => value + 1);
             pocket.notify("error", `Tooling operation failed: ${message}`);
         };
-        const prepare = async (provider, action, extra = {}) => {
-            const stop = startOperation(`Preparing ${action}`);
+        const runOperation = async (provider, action, extra = {}) => {
+            const stop = startOperation(`${action} ${provider}`);
             if (!stop) return;
             try {
-                const data = await pocket.api(toolingPath(conversationId, "prepare"),
+                const result = await pocket.api(toolingPath(conversationId, "execute"),
                     { provider, action, ...extra }, { signal: stop.signal });
                 if (!current(stop)) return;
-                if (!safeStr(data?.token) || !safeStr(data?.title) || !safeStr(data?.command)
-                    || !safeStr(data?.warning) || !Number.isFinite(data?.expiresAt)) {
-                    throw new Error("Invalid confirmation plan; nothing was executed.");
-                }
-                const prepared = { ...data, conversationId, cwd };
-                plan.current = prepared;
-                setConsented(false);
-                setClock(Date.now());
-                setConfirmation(prepared);
-            } catch (failure) {
-                failOperation(stop, failure);
-            } finally {
-                finishOperation(stop);
-            }
-        };
-        const cancelConfirmation = () => {
-            if (operation.current) return;
-            plan.current = null;
-            setConfirmation(null);
-            setConsented(false);
-        };
-        const execute = async () => {
-            const prepared = plan.current;
-            if (!isOwner() || !consented || !prepared || prepared !== confirmation || operation.current || snapshot?.busy
-                || prepared.conversationId !== pocket.conversationId() || prepared.cwd !== cwd
-                || prepared.expiresAt <= Date.now() || error || disposed) return;
-            const stop = newController();
-            operation.current = stop;
-            setBusy("Executing confirmed operation");
-            setActionError("");
-            try {
-                const result = await pocket.api(toolingPath(conversationId, "execute"),
-                    { token: prepared.token, confirmed: true }, { signal: stop.signal });
-                if (!current(stop)) return;
-                setOutcome(displayValue(result));
+                if (action !== "refresh") setOutcome(displayValue(result));
                 setRefresh((value) => value + 1);
                 updateStatus();
-            } catch (failure) {
-                failOperation(stop, failure);
-            } finally {
-                if (current(stop)) {
-                    plan.current = null;
-                    setConfirmation(null);
-                    setConsented(false);
-                }
-                finishOperation(stop);
-            }
+            } catch (failure) { failOperation(stop, failure); }
+            finally { finishOperation(stop); }
         };
         const runLifecycle = async (action, serverId) => {
             const stop = startOperation(`${action} ${serverId}`);
@@ -326,9 +272,9 @@ export default function setup(pocket) {
             ${field("Provider checked at", displayTime(status?.checkedAt))}
             ${status?.error ? html`<div class="error-box" role="alert">${displayValue(status.error)}</div>` : ""}
             <div style=${ROW_STYLE}>
-                ${button("Refresh", () => prepare(provider, "refresh"))}
-                ${status?.canInstall || status?.installCmd ? button("Install", () => prepare(provider, "install")) : ""}
-                ${status?.canUninstall || status?.uninstallCmd ? button("Uninstall", () => prepare(provider, "uninstall")) : ""}
+                ${button("Refresh", () => runOperation(provider, "refresh"))}
+                ${status?.canInstall || status?.installCmd ? button("Install", () => runOperation(provider, "install")) : ""}
+                ${status?.canUninstall || status?.uninstallCmd ? button("Uninstall", () => runOperation(provider, "uninstall")) : ""}
             </div>
         </div>`;
 
@@ -338,7 +284,6 @@ export default function setup(pocket) {
         const indexExists = graph?.checkedAt === undefined ? "Not checked" : graph?.initialized;
         const filtered = servers.filter((server) => filter === "running" ? server.running
             : filter === "detected" ? server.matched !== false || server.running : true);
-        const expired = confirmation && confirmation.expiresAt <= clock;
 
         return html`<div style="padding: 1rem; font-size: 0.85rem; height: 100%; overflow-y: auto;">
             <div style="overflow-wrap: anywhere;"><strong>Tooling</strong>${field("Workspace", cwd || (loading ? "Loading" : "Unknown"))}</div>
@@ -354,26 +299,11 @@ export default function setup(pocket) {
             ${busy || snapshot?.busy ? html`<p role="status">${busy || displayValue(snapshot.busy)} · awaited operation; navigation cancels this request.</p>` : ""}
             ${actionError ? html`<div class="error-box" role="alert">${actionError}</div>` : ""}
             ${outcome ? html`<div style=${CARD_STYLE} role="status">Operation outcome: ${outcome}</div>` : ""}
-            ${confirmation ? html`<div style=${CARD_STYLE} role="region" aria-label="Confirm exact Tooling operation">
-                <strong>${confirmation.title}</strong>
-                ${field("Workspace", confirmation.cwd)}
-                <pre style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto;">${confirmation.command}</pre>
-                ${confirmation.npmRoot ? field("Global npm package root", confirmation.npmRoot) : ""}
-                ${Array.isArray(confirmation.preview) ? confirmation.preview.map((item) => html`<div style=${CARD_STYLE}><strong>${shortStr(item.file)}</strong><pre style="white-space: pre-wrap; max-height: 12rem; overflow: auto;">${item.diff}</pre>${item.truncated ? html`<p class="muted">Diff preview truncated; inspect the full source before approval.</p>` : ""}</div>`) : ""}
-                <div class="error-box">${confirmation.warning}</div>
-                <p class="muted">Expires ${displayTime(confirmation.expiresAt)}${expired ? " · expired; prepare again" : ""}</p>
-                <label style=${ROW_STYLE}><input type="checkbox" checked=${consented} disabled=${Boolean(busy)}
-                    onChange=${(event) => setConsented(event.currentTarget.checked)} />
-                    I approve this exact operation and understand it runs unsandboxed.</label>
-                <div style=${ROW_STYLE}><button class="button" disabled=${!owner || !consented || Boolean(busy) || expired || Boolean(error) || Boolean(snapshot?.busy) || confirmation.cwd !== cwd}
-                    onClick=${execute}>Confirm and execute</button>
-                    <button class="button" disabled=${Boolean(busy)} onClick=${cancelConfirmation}>Cancel</button></div>
-            </div>` : ""}
             ${snapshot && tab === "Overview" ? html`<div role="tabpanel" aria-label="Overview" style="margin-top: 0.8rem;">
                 <div style=${CARD_STYLE}><strong>LSP</strong>${field("Active servers", servers.filter((server) => server.running).length)}
                     ${field("Detected project matches", servers.some((server) => server.matched === null || server.matched === undefined)
                         ? "Not checked for all servers" : servers.filter((server) => server.matched).length)}
-                    ${button("Refresh LSP", () => prepare("lsp", "refresh"))}</div>
+                    ${button("Refresh LSP", () => runOperation("lsp", "refresh"))}</div>
                 <div style=${CARD_STYLE}><strong>AST</strong>${field("Installed / detected", cachedAvailability(ast))}${field("Version", ast?.version)}
                     ${ast?.error ? html`<div class="error-box">${displayValue(ast.error)}</div>` : ""}</div>
                 <div style=${CARD_STYLE}><strong>CodeGraph</strong>${field("Installed / detected", cachedAvailability(graph))}
@@ -383,15 +313,15 @@ export default function setup(pocket) {
                 <h3>Proposals</h3>
                 ${(snapshot.proposals || []).length ? (snapshot.proposals || []).slice(0, 30).map((proposal) => html`<div style=${CARD_STYLE}>
                     <strong>${shortStr(proposal.title) || "Edit proposal"}</strong>${field("Proposal", proposal.id)}
-                    ${field("Files", proposal.files)}${field("Command consent required", proposal.requiresConsent)}
-                    ${button(proposal.requiresConsent ? "Review command consent" : "Review apply", () => prepare("lsp", "apply", { proposalId: proposal.id }))}
+                    ${field("Files", proposal.files)}${field("Includes server command", proposal.hasCommand)}
+                    ${button("Apply", () => runOperation("lsp", "apply", { proposalId: proposal.id }))}
                 </div>`) : html`<p class="muted">No pending proposals in this workspace.</p>`}
                 ${(snapshot.proposals || []).length > 30 ? html`<p class="muted">Showing the first 30 proposals.</p>` : ""}
             </div>` : ""}
             ${snapshot && tab === "LSP" ? html`<div role="tabpanel" aria-label="LSP" style="margin-top: 0.8rem;">
                 <div style=${ROW_STYLE}>${["detected", "running", "all"].map((value) => html`<button class="button"
                     aria-pressed=${filter === value} onClick=${() => setFilter(value)}>${value === "all" ? "All" : value === "running" ? "Running" : "Detected"}</button>`)}
-                    ${button("Refresh", () => prepare("lsp", "refresh"))}</div>
+                    ${button("Refresh", () => runOperation("lsp", "refresh"))}</div>
                 ${filtered.length ? filtered.map((server) => html`<div style=${CARD_STYLE}>
                     <div style=${ROW_STYLE}><span style="width: 8px; height: 8px; border-radius: 50%; background: ${server.running
                         ? "var(--success, #22c55e)" : serverAvailability(server) === true ? "var(--accent, #3b82f6)" : "var(--text-dim, #555)"};"></span>
@@ -407,10 +337,10 @@ export default function setup(pocket) {
                         ${server.running ? button("Stop", () => runLifecycle("stop", server.id))
                             : serverAvailability(server) === true ? button("Start", () => runLifecycle("start", server.id))
                             : serverAvailability(server) === null ? html`<span class="muted">Not checked · use Refresh</span>`
-                            : server.installCmd ? button("Install", () => prepare("lsp", "install", { serverId: server.id }))
+                            : server.installCmd ? button("Install", () => runOperation("lsp", "install", { serverId: server.id }))
                             : html`<span class="muted">Not installed</span>`}
                         ${serverAvailability(server) === true && server.uninstallCmd && !server.running
-                            ? button("Uninstall", () => prepare("lsp", "uninstall", { serverId: server.id })) : ""}
+                            ? button("Uninstall", () => runOperation("lsp", "uninstall", { serverId: server.id })) : ""}
                     </div>
                 </div>`) : html`<p class="muted">${filter === "running" ? "No language servers running for this workspace."
                     : filter === "detected" ? `No project matches. Click All to browse ${servers.length} supported servers.` : "No language servers returned."}</p>`}
@@ -430,9 +360,9 @@ export default function setup(pocket) {
                     ${field("Last operation", graph?.lastOperation)}
                     <p class="muted">Installation is not an index. Engine compatibility is distinct from source freshness; an unchecked timestamp does not prove current sources.</p>
                     <div style=${ROW_STYLE}>
-                        ${button("Create index", () => prepare("graph", "create"), !graph?.available || graph?.compatible === false || graph?.initialized !== false)}
-                        ${button("Sync index", () => prepare("graph", "sync"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
-                        ${button("Rebuild index", () => prepare("graph", "rebuild"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
+                        ${button("Create index", () => runOperation("graph", "create"), !graph?.available || graph?.compatible === false || graph?.initialized !== false)}
+                        ${button("Sync index", () => runOperation("graph", "sync"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
+                        ${button("Rebuild index", () => runOperation("graph", "rebuild"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
                     </div>
                 </div>
             </div>` : ""}

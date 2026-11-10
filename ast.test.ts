@@ -4,9 +4,9 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
-import { AstProvider } from "./pi-lsp/v1.3.0/ast.ts";
-import { createProcessRunner } from "./pi-lsp/v1.3.0/process.ts";
-import { createProposal, applyProposal } from "./pi-lsp/v1.3.0/proposals.ts";
+import { AstProvider } from "./pi-lsp/v1.3.1/ast.ts";
+import { createProcessRunner } from "./pi-lsp/v1.3.1/process.ts";
+import { createProposal, applyProposal } from "./pi-lsp/v1.3.1/proposals.ts";
 const find = (command: string) => (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, command)).find((path) => existsSync(path));
 const binary = find("ast-grep");
 async function fixture(run: (root: string, file: string, ast: AstProvider) => Promise<void>) {

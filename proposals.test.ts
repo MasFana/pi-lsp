@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile, symlink, stat } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { applyProposal, createProposal, type Proposal } from "./pi-lsp/v1.3.0/proposals.ts";
+import { applyProposal, createProposal, type Proposal } from "./pi-lsp/v1.3.1/proposals.ts";
 
 async function fixture(run: (root: string, file: string) => Promise<void>) {
     const root = await mkdtemp(join(tmpdir(), "fana-proposal-test-"));

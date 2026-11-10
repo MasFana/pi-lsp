@@ -195,7 +195,7 @@ export async function executeLspQuery(bridge: LspBridge, cwd: string, args: LspQ
                     const proposal = await makeEdit(action.edit, String(action.title), command);
                     if (!command && proposal.fileEdits.every((file) => file.edits.length === 0)) { rows.push({ title: action.title, noChanges: true }); continue; }
                     proposals.push(proposal);
-                    rows.push({ title: action.title, proposalIndex: proposals.length - 1, requiresConsent: !!command });
+                    rows.push({ title: action.title, proposalIndex: proposals.length - 1, hasCommand: !!command });
                 } catch (error) { rows.push({ title: action.title, unsupported: error instanceof Error ? error.message : "Unsupported edit" }); }
             }
             return { status: rows.length ? "ok" : "empty", server: client.id, items: rows, total: actions?.length ?? 0, offset, nextOffset: (actions?.length ?? 0) > offset + pageSize ? offset + pageSize : undefined, truncated: (actions?.length ?? 0) > offset + pageSize, proposals, message: incomplete ? "Diagnostic context incomplete; actions are not proof of a verified file" : undefined };

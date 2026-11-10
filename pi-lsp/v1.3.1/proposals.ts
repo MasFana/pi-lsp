@@ -211,7 +211,7 @@ export async function applyProposal(proposal: Proposal, options: { assertOwner()
     } finally { release(); if (locks.get(root) === own) locks.delete(root); }
 }
 export function summarizeProposal(proposal: Proposal) {
-    return { id: proposal.id, title: proposal.title, provider: proposal.provider, action: proposal.action, changedFiles: proposal.files.map((file) => file.file), requiresCommand: !!proposal.command, command: proposal.command ? { server: proposal.command.server, command: proposal.command.command } : undefined, expiresAt: proposal.expiresAt,
+    return { id: proposal.id, title: proposal.title, provider: proposal.provider, action: proposal.action, changedFiles: proposal.files.map((file) => file.file), hasCommand: !!proposal.command, command: proposal.command ? { server: proposal.command.server, command: proposal.command.command } : undefined, expiresAt: proposal.expiresAt,
         diffs: proposal.files.slice(0, 20).map((file) => {
             const before = file.before.split("\n"), after = file.after.split("\n");
             let start = 0; while (start < before.length && start < after.length && before[start] === after[start]) start++;
