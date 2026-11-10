@@ -11,7 +11,7 @@ const messageOf = (error: unknown) => error instanceof Error ? error.message : S
 function within(root: string, path: string) { const rel = relative(root, path); return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); }
 function snapshot(status: ProviderStatus): ProviderStatus { return structuredClone(status); }
 function initial(cwd: string): ProviderStatus {
-    return { id: "codegraph", available: false, actions: [...actions], indexRoot: resolve(cwd), initialized: false, buildState: "unknown", engineCompatibility: "unknown", sourceFreshness: "unknown", coverage: "unknown", trustPolicy: "Verified CodeGraph 1.6.2 SDK; explicit owner operations only; no watchers, hooks, daemon or automatic indexing", error: "CodeGraph has not been explicitly probed" };
+    return { id: "codegraph", available: false, actions: [...actions], indexRoot: resolve(cwd), initialized: false, buildState: "unknown", engineCompatibility: "unknown", sourceFreshness: "unknown", coverage: "unknown", trustPolicy: "Verified CodeGraph 1.6.2 SDK; owner source watcher and incremental sync of existing indexes; no hooks, daemon or automatic index creation", error: "CodeGraph has not been detected yet" };
 }
 
 /** CodeGraph is isolated from Pocket's runtime; cached panel reads never perform I/O. */
@@ -164,6 +164,7 @@ export class GraphProvider {
             const reply = await this.worker(root, install, { kind: "query", args: { ...args, depth: args.depth ?? 2, maxResults: args.maxResults ?? 30 } }, signal);
             if (this.operations.has(key)) return { status: "unavailable", message: "A conflicting graph operation started during query; result discarded", provider: this.cachedStatus(key) };
             const current = this.store(key, this.merged(key, install, reply, changeVersion));
+            if ((this.changes.get(key) ?? 0) !== changeVersion) return { status: "unavailable", message: "Source changed during graph query; result discarded, retry after automatic sync", provider: current };
             return { ...(reply.result ?? { status: "unavailable", message: reply.error ?? "CodeGraph returned no query result" }), sourceFreshness: current.sourceFreshness, ...(current.sourceCheckedAt !== undefined ? { sourceCheckedAt: current.sourceCheckedAt } : {}), provider: current };
         } catch (error) {
             const current = this.store(key, { ...this.cachedStatus(key), error: messageOf(error) });

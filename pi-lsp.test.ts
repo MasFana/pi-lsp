@@ -23,6 +23,11 @@ let extension: Extension;
 let tools: NonNullable<Extension["tools"]>;
 let hookCwd = workspace;
 const settings = new Map<string, unknown>();
+interface InstallerOutcome { ok?: boolean; status: string; available?: boolean; executable?: string; installer?: { exitCode: number }; error?: string; servers?: unknown }
+interface RequestFixture { body: unknown; user: { id: string }; signal: AbortSignal; context: typeof context; snapshot(): Promise<undefined>; commit(change: (tx: { doc(): Promise<{ value: unknown }> }) => unknown): Promise<unknown> }
+type RouteFixture = (request: RequestFixture) => Promise<InstallerOutcome>;
+const routes = new Map<string, RouteFixture>();
+let disposeManual: (() => Promise<void>) | undefined;
 const api = { conversationId: 1, env: { cwd: workspace }, agent: async () => ({ cwd: workspace }) } as never;
 const host: Pick<Host, "requesterOf" | "roleOf" | "cwdOf"> = {
     requesterOf: (id) => id === 1 ? "owner-person" : id === 2 ? "guest-person" : undefined,
@@ -111,7 +116,7 @@ process.stdin.on('data',chunk=>{
     for (const id of Object.keys(lsp.LSP_SERVERS)) delete lsp.LSP_SERVERS[id];
     lsp.LSP_SERVERS.fixture = { command: process.execPath, args: [fixture, "valid", shutdownLog], fileTypes: [".ts"], rootMarkers: ["package.json"] };
     const web = {
-        client() {}, route() {}, conversationRoute() {}, onDispose() {}, settings() {}, send() {},
+        client() {}, route(method: string, path: string, handler: RouteFixture) { routes.set(`${method} ${path}`, handler); }, conversationRoute() {}, onDispose(dispose: () => Promise<void>) { disposeManual = dispose; }, settings() {}, send() {},
         setting: (name: string) => settings.get(name),
         error: (status: number, message: string) => Object.assign(new Error(message), { status }),
     };
@@ -119,7 +124,7 @@ process.stdin.on('data',chunk=>{
     tools = extension.tools!;
 });
 
-after(async () => { await lsp?.stopAllClients(); await app?.close(); cleanUp(); });
+after(async () => { await disposeManual?.(); await lsp?.stopAllClients(); await app?.close(); cleanUp(); });
 const tool = (name: string) => tools.find(item => item.name === name)!;
 async function diagnostics(file = "source.ts") {
     const result = await tool("lsp_diagnostics").execute({ file } as never, api, context);
@@ -187,6 +192,46 @@ test("status is workspace-scoped and executable lookup honors ancestor bins and 
     mkdirSync(join(bin, "directory-only"));
     assert.equal(lsp.findExecutable("directory-only", nested), undefined);
     assert.equal(lsp.matchesMarkersOrExtensions(lsp.LSP_SERVERS.fixture, nested), true);
+});
+
+test("Go install bin discovery works without PATH and preserves workspace precedence", () => {
+    const old = process.env.GOBIN, oldPath = process.env.PATH;
+    const bin = join(root, "go tools"), local = join(workspace, "node_modules", ".bin", "gopls");
+    mkdirSync(bin); const executable = join(bin, "gopls");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.GOBIN = bin;
+    process.env.PATH = "";
+    try {
+        assert.equal(lsp.findExecutable("gopls", workspace), executable);
+        writeFileSync(local, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        assert.equal(lsp.findExecutable("gopls", workspace), local);
+    } finally {
+        if (old === undefined) delete process.env.GOBIN; else process.env.GOBIN = old;
+        if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    }
+});
+
+test("all installer routes verify discovery; failed updates retain availability without claiming success", async () => {
+    const executable = join(root, "installer-server");
+    const request = (body: unknown): RequestFixture => ({ body, user: { id: "owner-person" }, signal: new AbortController().signal, context, snapshot: async () => undefined, commit: async (change) => change({ doc: async () => ({ value: null }) }) });
+    lsp.LSP_SERVERS.installFixture = { command: executable, fileTypes: [".fixture"], rootMarkers: [], installCmd: "true", uninstallCmd: "true" };
+    try {
+        const missing = await routes.get("POST install")!(request({ serverId: "installFixture" }));
+        assert.equal(missing.ok, false); assert.equal(missing.status, "failed");
+        assert.equal(missing.installer?.exitCode, 0); assert.match(missing.error ?? "", /no usable provider executable/);
+        assert.equal(missing.servers, undefined, "Operation outcomes must not dump the whole registry");
+        writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        lsp.LSP_SERVERS.installFixture.installCmd = "printf 'update failed' >&2; exit 7";
+        const update = await routes.get("POST tooling/execute")!(request({ provider: "lsp", action: "install", serverId: "installFixture" }));
+        assert.equal(update.status, "failed"); assert.equal(update.available, true);
+        assert.equal(update.executable, executable); assert.equal(update.installer?.exitCode, 7);
+        assert.match(update.error ?? "", /update failed/);
+        const unchanged = await routes.get("POST uninstall")!(request({ serverId: "installFixture" }));
+        assert.equal(unchanged.ok, false); assert.match(unchanged.error ?? "", /removal is not verified/);
+        lsp.LSP_SERVERS.installFixture.installCmd = "true";
+        const detected = await routes.get("POST install")!(request({ serverId: "installFixture" }));
+        assert.equal(detected.ok, true); assert.equal(detected.executable, executable);
+    } finally { delete lsp.LSP_SERVERS.installFixture; }
 });
 
 test("non-owners cannot stop an owner's client, start processes or synchronize files", async () => {

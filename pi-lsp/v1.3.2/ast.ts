@@ -103,7 +103,7 @@ export class AstProvider {
 
     cachedStatus(cwd: string): ProviderStatus {
         const status = this.statuses.get(resolve(cwd));
-        return status ? { ...status, actions: [...status.actions] } : { id: "ast-grep", available: false, actions: [], configuration: "disabled", parserPolicy: "bundled standard grammars only", error: "Not probed; owner refresh required" };
+        return status ? { ...status, actions: [...status.actions] } : { id: "ast-grep", available: false, actions: [], configuration: "disabled", parserPolicy: "bundled standard grammars only", error: "Provider detection is pending" };
     }
 
     async probe(cwd: string, signal?: AbortSignal): Promise<ProviderStatus> {
@@ -132,7 +132,7 @@ export class AstProvider {
                 return this.cachedStatus(cwd);
             } catch (error) { signal?.throwIfAborted(); failures.push(messageOf(error)); }
         }
-        this.statuses.set(resolve(cwd), { id: "ast-grep", available: false, compatible: false, actions: [], checkedAt: Date.now(), configuration: "disabled", parserPolicy: "bundled standard grammars only", error: failures.join("; ") || "ast-grep executable not found; install manually and refresh" });
+        this.statuses.set(resolve(cwd), { id: "ast-grep", available: false, compatible: false, actions: [], checkedAt: Date.now(), configuration: "disabled", parserPolicy: "bundled standard grammars only", error: failures.join("; ") || "ast-grep executable not found; use lsp_manage to install it for the task" });
         return this.cachedStatus(cwd);
     }
 

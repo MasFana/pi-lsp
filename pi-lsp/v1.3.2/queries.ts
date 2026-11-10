@@ -14,7 +14,7 @@ export interface LspBridge {
     sync(client: ActiveClient, file: string): void;
     diagnose(cwd: string, file: string, context: Context, assertOwner: () => void): Promise<{ diagnostics: unknown[]; incomplete: boolean }>;
     servers(cwd: string): Promise<unknown[]>;
-    config(server: string): { installCmd?: string; uninstallCmd?: string } | undefined;
+    config(server: string): { command: string; installCmd?: string; uninstallCmd?: string } | undefined;
 }
 export interface LspQuery {
     action: "references" | "hover" | "document_symbols" | "workspace_symbols" | "implementation" | "code_actions" | "rename_preview" | "format_preview";

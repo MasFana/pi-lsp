@@ -5,14 +5,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { Type } from "typebox";
 import { defineExtension, defineTool, hook, section, ToolTask } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Host as PocketHost, Web as ExtensionWeb, WebRequest, ConversationWebRequest } from "./_pocket.d.ts";
-import { createTooling } from "./pi-lsp/v1.3.1/tooling.ts";
-import { canonicalFile } from "./pi-lsp/v1.3.1/proposals.ts";
+import { createTooling } from "./pi-lsp/v1.3.2/tooling.ts";
+import { canonicalFile } from "./pi-lsp/v1.3.2/proposals.ts";
 
 export const pocketApi = 2;
 
@@ -38,12 +39,13 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
         installCmd: "npm install -g typescript typescript-language-server",
         uninstallCmd: "npm uninstall -g typescript-language-server",
+        initOptions: { hostInfo: "pi-pocket", preferences: { includeInlayParameterNameHints: "all", includeInlayVariableTypeHints: true, includeInlayFunctionParameterTypeHints: true } },
     },
     "typescript-native": {
         command: "tsc",
         args: ["--lsp", "--stdio"],
         fileTypes: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
-        rootMarkers: ["tsconfig.json", "package.json"],
+        rootMarkers: ["tsconfig.json","package.json","jsconfig.json"],
         installCmd: "npm install -g typescript@next",
         uninstallCmd: "npm uninstall -g typescript",
     },
@@ -54,6 +56,8 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["Cargo.toml", "rust-analyzer.toml"],
         installCmd: "rustup component add rust-analyzer",
         uninstallCmd: "rustup component remove rust-analyzer",
+        initOptions: {},
+        settings: {"rust-analyzer":{"checkOnSave":false}},
     },
     gopls: {
         command: "gopls",
@@ -61,15 +65,17 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         fileTypes: [".go", ".mod", ".sum"],
         rootMarkers: ["go.mod", "go.work", "go.sum"],
         installCmd: "go install golang.org/x/tools/gopls@latest",
-        uninstallCmd: "rm -f $(which gopls)",
+        uninstallCmd: 'bin=$(go env GOBIN) && if [ -z "$bin" ]; then gp=$(go env GOPATH) && bin="${gp%%:*}/bin"; fi && test -n "$bin" && rm -f "$bin/gopls"',
+        settings: {"gopls":{"analyses":{"unusedparams":true,"shadow":true},"staticcheck":true,"gofumpt":true}},
     },
     pyright: {
         command: "pyright-langserver",
         args: ["--stdio"],
         fileTypes: [".py", ".pyi"],
-        rootMarkers: ["pyproject.toml", "setup.py", "requirements.txt", "pyrightconfig.json"],
+        rootMarkers: ["pyproject.toml","setup.py","requirements.txt","pyrightconfig.json","setup.cfg","Pipfile"],
         installCmd: "npm install -g pyright",
         uninstallCmd: "npm uninstall -g pyright",
+        settings: {"python":{"analysis":{"autoSearchPaths":true,"diagnosticMode":"openFilesOnly","useLibraryCodeForTypes":true}}},
     },
     basedpyright: {
         command: "basedpyright-langserver",
@@ -78,12 +84,13 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["pyproject.toml", "setup.py", "requirements.txt", "pyrightconfig.json"],
         installCmd: "npm install -g basedpyright",
         uninstallCmd: "npm uninstall -g basedpyright",
+        settings: {"basedpyright":{"analysis":{"autoSearchPaths":true,"diagnosticMode":"openFilesOnly","useLibraryCodeForTypes":true}}},
     },
     pylsp: {
         command: "pylsp",
         args: [],
         fileTypes: [".py"],
-        rootMarkers: ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+        rootMarkers: ["pyproject.toml","setup.py","setup.cfg","requirements.txt","Pipfile"],
         installCmd: "pip install 'python-lsp-server[all]'",
         uninstallCmd: "pip uninstall -y python-lsp-server",
     },
@@ -100,7 +107,7 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "ty",
         args: ["server"],
         fileTypes: [".py", ".pyi"],
-        rootMarkers: ["pyproject.toml", "ty.toml"],
+        rootMarkers: ["pyproject.toml","ty.toml","setup.py","setup.cfg","requirements.txt","Pipfile"],
         installCmd: "pip install ty",
         uninstallCmd: "pip uninstall -y ty",
     },
@@ -124,13 +131,14 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "deno",
         args: ["lsp"],
         fileTypes: [".ts", ".tsx", ".js", ".jsx", ".mjs"],
-        rootMarkers: ["deno.json", "deno.jsonc"],
+        rootMarkers: ["deno.json","deno.jsonc","deno.lock"],
         installCmd: "curl -fsSL https://deno.land/install.sh | sh",
+        initOptions: {"enable":true,"lint":true,"unstable":true},
     },
     biome: {
         command: "biome",
         args: ["lsp-proxy"],
-        fileTypes: [".ts", ".tsx", ".js", ".jsx", ".json", ".jsonc", ".css"],
+        fileTypes: [".ts",".tsx",".js",".jsx",".json",".jsonc",".css",".mjs",".cjs"],
         rootMarkers: ["biome.json", "biome.jsonc"],
         isLinter: true,
         installCmd: "npm install -g @biomejs/biome",
@@ -139,11 +147,12 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     eslint: {
         command: "vscode-eslint-language-server",
         args: ["--stdio"],
-        fileTypes: [".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"],
-        rootMarkers: [".eslintrc", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", "eslint.config.mjs"],
+        fileTypes: [".js",".jsx",".ts",".tsx",".vue",".svelte",".mjs",".cjs"],
+        rootMarkers: [".eslintrc",".eslintrc.json",".eslintrc.js","eslint.config.js","eslint.config.mjs",".eslintrc.yml"],
         isLinter: true,
         installCmd: "npm install -g vscode-langservers-extracted",
         uninstallCmd: "npm uninstall -g vscode-langservers-extracted",
+        settings: {"validate":"on","run":"onType"},
     },
     "vscode-html-language-server": {
         command: "vscode-html-language-server",
@@ -152,14 +161,16 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["package.json", ".git"],
         installCmd: "npm install -g vscode-langservers-extracted",
         uninstallCmd: "npm uninstall -g vscode-langservers-extracted",
+        initOptions: {"provideFormatter":true},
     },
     "vscode-css-language-server": {
         command: "vscode-css-language-server",
         args: ["--stdio"],
-        fileTypes: [".css", ".scss", ".less"],
+        fileTypes: [".css",".scss",".less",".sass"],
         rootMarkers: ["package.json", ".git"],
         installCmd: "npm install -g vscode-langservers-extracted",
         uninstallCmd: "npm uninstall -g vscode-langservers-extracted",
+        initOptions: {"provideFormatter":true},
     },
     "vscode-json-language-server": {
         command: "vscode-json-language-server",
@@ -168,12 +179,13 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["package.json", ".git"],
         installCmd: "npm install -g vscode-langservers-extracted",
         uninstallCmd: "npm uninstall -g vscode-langservers-extracted",
+        initOptions: {"provideFormatter":true},
     },
     tailwindcss: {
         command: "tailwindcss-language-server",
         args: ["--stdio"],
-        fileTypes: [".html", ".css", ".scss", ".jsx", ".tsx", ".vue", ".svelte"],
-        rootMarkers: ["tailwind.config.js", "tailwind.config.cjs", "tailwind.config.ts"],
+        fileTypes: [".html",".css",".scss",".jsx",".tsx",".vue",".svelte",".js",".ts"],
+        rootMarkers: ["tailwind.config.js","tailwind.config.cjs","tailwind.config.ts","tailwind.config.mjs"],
         installCmd: "npm install -g @tailwindcss/language-server",
         uninstallCmd: "npm uninstall -g @tailwindcss/language-server",
     },
@@ -181,7 +193,7 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "svelteserver",
         args: ["--stdio"],
         fileTypes: [".svelte"],
-        rootMarkers: ["svelte.config.js", "package.json"],
+        rootMarkers: ["svelte.config.js","package.json","svelte.config.mjs"],
         installCmd: "npm install -g svelte-language-server",
         uninstallCmd: "npm uninstall -g svelte-language-server",
     },
@@ -189,7 +201,7 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "vue-language-server",
         args: ["--stdio"],
         fileTypes: [".vue"],
-        rootMarkers: ["vite.config.ts", "vite.config.js", "package.json"],
+        rootMarkers: ["vite.config.ts","vite.config.js","package.json","vue.config.js","nuxt.config.js","nuxt.config.ts"],
         installCmd: "npm install -g @vue/language-server",
         uninstallCmd: "npm uninstall -g @vue/language-server",
     },
@@ -197,7 +209,7 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "astro-ls",
         args: ["--stdio"],
         fileTypes: [".astro"],
-        rootMarkers: ["astro.config.mjs", "astro.config.ts", "package.json"],
+        rootMarkers: ["astro.config.mjs","astro.config.ts","package.json","astro.config.js"],
         installCmd: "npm install -g @astrojs/language-server",
         uninstallCmd: "npm uninstall -g @astrojs/language-server",
     },
@@ -208,14 +220,16 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: [".git", "Makefile"],
         installCmd: "npm install -g bash-language-server",
         uninstallCmd: "npm uninstall -g bash-language-server",
+        settings: {"bashIde":{"globPattern":"*@(.sh|.inc|.bash|.command)"}},
     },
     "lua-language-server": {
         command: "lua-language-server",
         args: [],
         fileTypes: [".lua"],
-        rootMarkers: [".luarc.json", ".luacheckrc", ".git"],
+        rootMarkers: [".luarc.json",".luacheckrc",".git",".luarc.jsonc",".stylua.toml","stylua.toml"],
         installCmd: "brew install lua-language-server",
         uninstallCmd: "brew uninstall lua-language-server",
+        settings: {"Lua":{"runtime":{"version":"LuaJIT"},"diagnostics":{"globals":["vim"]},"workspace":{"checkThirdParty":false},"telemetry":{"enable":false}}},
     },
     yamlls: {
         command: "yaml-language-server",
@@ -224,12 +238,13 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: [".git"],
         installCmd: "npm install -g yaml-language-server",
         uninstallCmd: "npm uninstall -g yaml-language-server",
+        settings: {"yaml":{"validate":true,"format":{"enable":true},"hover":true,"completion":true},"redhat":{"telemetry":{"enabled":false}}},
     },
     dockerls: {
         command: "docker-langserver",
         args: ["--stdio"],
         fileTypes: ["Dockerfile", "dockerfile", ".dockerfile"],
-        rootMarkers: ["Dockerfile", ".git"],
+        rootMarkers: ["Dockerfile",".git","docker-compose.yml","docker-compose.yaml",".dockerignore"],
         installCmd: "npm install -g dockerfile-language-server-nodejs",
         uninstallCmd: "npm uninstall -g dockerfile-language-server-nodejs",
     },
@@ -252,7 +267,7 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     "emmet-language-server": {
         command: "emmet-language-server",
         args: ["--stdio"],
-        fileTypes: [".html", ".css", ".jsx", ".tsx"],
+        fileTypes: [".html",".css",".jsx",".tsx",".scss",".less",".vue",".svelte"],
         rootMarkers: ["package.json", ".git"],
         installCmd: "npm install -g @olrtg/emmet-language-server",
         uninstallCmd: "npm uninstall -g @olrtg/emmet-language-server",
@@ -260,8 +275,8 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     intelephense: {
         command: "intelephense",
         args: ["--stdio"],
-        fileTypes: [".php"],
-        rootMarkers: ["composer.json", ".git"],
+        fileTypes: [".php",".phtml"],
+        rootMarkers: ["composer.json",".git","composer.lock"],
         installCmd: "npm install -g intelephense",
         uninstallCmd: "npm uninstall -g intelephense",
     },
@@ -269,30 +284,33 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "phpactor",
         args: ["language-server"],
         fileTypes: [".php"],
-        rootMarkers: ["composer.json", ".git"],
+        rootMarkers: ["composer.json",".git",".phpactor.json",".phpactor.yml"],
         installCmd: "composer global require phpactor/phpactor",
         uninstallCmd: "composer global remove phpactor/phpactor",
     },
     solargraph: {
         command: "solargraph",
         args: ["stdio"],
-        fileTypes: [".rb"],
-        rootMarkers: ["Gemfile", ".git"],
+        fileTypes: [".rb",".rake",".gemspec"],
+        rootMarkers: ["Gemfile",".git",".solargraph.yml","Rakefile"],
         installCmd: "gem install solargraph",
         uninstallCmd: "gem uninstall solargraph",
+        initOptions: {"formatting":true},
+        settings: {"solargraph":{"diagnostics":true,"completion":true,"hover":true,"formatting":true,"references":true,"rename":true,"symbols":true}},
     },
     "ruby-lsp": {
         command: "ruby-lsp",
         args: [],
-        fileTypes: [".rb"],
-        rootMarkers: ["Gemfile", ".git"],
+        fileTypes: [".rb",".rake",".gemspec",".erb"],
+        rootMarkers: ["Gemfile",".git",".ruby-version",".ruby-gemset"],
         installCmd: "gem install ruby-lsp",
         uninstallCmd: "gem uninstall ruby-lsp",
+        initOptions: {"formatter":"auto"},
     },
     rubocop: {
         command: "rubocop",
         args: ["--lsp"],
-        fileTypes: [".rb"],
+        fileTypes: [".rb",".rake"],
         rootMarkers: [".rubocop.yml", "Gemfile", ".git"],
         isLinter: true,
         installCmd: "gem install rubocop",
@@ -301,16 +319,17 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     elixirls: {
         command: "elixir-ls",
         args: [],
-        fileTypes: [".ex", ".exs"],
-        rootMarkers: ["mix.exs"],
+        fileTypes: [".ex",".exs",".heex",".eex"],
+        rootMarkers: ["mix.exs","mix.lock"],
         installCmd: "brew install elixir-ls",
         uninstallCmd: "brew uninstall elixir-ls",
+        settings: {"elixirLS":{"dialyzerEnabled":true,"fetchDeps":false}},
     },
     erlangls: {
         command: "erlang_ls",
         args: [],
         fileTypes: [".erl", ".hrl"],
-        rootMarkers: ["rebar.config"],
+        rootMarkers: ["rebar.config","erlang.mk","rebar.lock"],
         installCmd: "brew install erlang-ls",
         uninstallCmd: "brew uninstall erlang-ls",
     },
@@ -326,15 +345,16 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "haskell-language-server-wrapper",
         args: ["--lsp"],
         fileTypes: [".hs", ".lhs"],
-        rootMarkers: ["cabal.project", "stack.yaml", "*.cabal"],
+        rootMarkers: ["cabal.project","stack.yaml","*.cabal","hie.yaml","package.yaml"],
         installCmd: "ghcup install hls",
         uninstallCmd: "ghcup rm hls",
+        settings: {"haskell":{"formattingProvider":"ormolu","checkProject":true}},
     },
     ocamllsp: {
         command: "ocamllsp",
         args: [],
-        fileTypes: [".ml", ".mli"],
-        rootMarkers: ["dune-project", "dune"],
+        fileTypes: [".ml",".mli",".mll",".mly"],
+        rootMarkers: ["dune-project","dune","dune-workspace","*.opam",".ocamlformat"],
         installCmd: "opam install ocaml-lsp-server",
         uninstallCmd: "opam remove ocaml-lsp-server",
     },
@@ -342,39 +362,40 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "jdtls",
         args: [],
         fileTypes: [".java"],
-        rootMarkers: ["pom.xml", "build.gradle", "build.gradle.kts"],
+        rootMarkers: ["pom.xml","build.gradle","build.gradle.kts","settings.gradle",".project"],
         installCmd: "brew install jdtls",
         uninstallCmd: "brew uninstall jdtls",
     },
     "kotlin-lsp": {
         command: "kotlin-lsp",
-        args: [],
+        args: ["--stdio"],
         fileTypes: [".kt", ".kts"],
-        rootMarkers: ["build.gradle.kts", "build.gradle", "pom.xml"],
+        rootMarkers: ["build.gradle.kts","build.gradle","pom.xml","settings.gradle","settings.gradle.kts"],
         installCmd: "brew install kotlin-language-server",
         uninstallCmd: "brew uninstall kotlin-language-server",
     },
     metals: {
         command: "metals",
         args: [],
-        fileTypes: [".scala", ".sbt"],
-        rootMarkers: ["build.sbt", ".bloop"],
+        fileTypes: [".scala",".sbt",".sc"],
+        rootMarkers: ["build.sbt",".bloop","build.sc","build.gradle","pom.xml"],
         installCmd: "brew install metals",
         uninstallCmd: "brew uninstall metals",
+        initOptions: {"statusBarProvider":"show-message","isHttpEnabled":true},
     },
     terraformls: {
         command: "terraform-ls",
         args: ["serve"],
         fileTypes: [".tf", ".tfvars"],
-        rootMarkers: [".terraform", ".git"],
+        rootMarkers: [".terraform",".git","terraform.tfstate","*.tf"],
         installCmd: "brew install terraform-ls",
         uninstallCmd: "brew uninstall terraform-ls",
     },
     "helm-ls": {
         command: "helm_ls",
         args: ["serve"],
-        fileTypes: [".yaml"],
-        rootMarkers: ["Chart.yaml"],
+        fileTypes: [".yaml",".yml",".tpl"],
+        rootMarkers: ["Chart.yaml","Chart.yml"],
         installCmd: "brew install helm-ls",
         uninstallCmd: "brew uninstall helm-ls",
     },
@@ -382,14 +403,14 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         command: "nixd",
         args: [],
         fileTypes: [".nix"],
-        rootMarkers: ["flake.nix", "default.nix"],
+        rootMarkers: ["flake.nix","default.nix","shell.nix"],
         installCmd: "nix-env -iA nixpkgs.nixd",
     },
     nil: {
         command: "nil",
         args: [],
         fileTypes: [".nix"],
-        rootMarkers: ["flake.nix", "default.nix"],
+        rootMarkers: ["flake.nix","default.nix","shell.nix"],
         installCmd: "nix-env -iA nixpkgs.nil",
     },
     ols: {
@@ -402,59 +423,69 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
     },
     dartls: {
         command: "dart",
-        args: ["language-server", "--client-id=pi-pocket"],
+        args: ["language-server","--protocol=lsp"],
         fileTypes: [".dart"],
-        rootMarkers: ["pubspec.yaml"],
+        rootMarkers: ["pubspec.yaml","pubspec.lock"],
         installCmd: "brew install dart",
         uninstallCmd: "brew uninstall dart",
+        initOptions: {"closingLabels":true,"flutterOutline":true,"outline":true},
     },
     texlab: {
         command: "texlab",
         args: [],
-        fileTypes: [".tex", ".bib"],
-        rootMarkers: [".latexmkrc", ".git"],
+        fileTypes: [".tex",".bib",".sty",".cls"],
+        rootMarkers: [".latexmkrc",".git","latexmkrc",".texlabroot","texlabroot","Tectonic.toml"],
         installCmd: "brew install texlab",
         uninstallCmd: "brew uninstall texlab",
+        settings: {"texlab":{"build":{"executable":"latexmk","args":["-pdf","-interaction=nonstopmode","-synctex=1","%f"]},"chktex":{"onOpenAndSave":true}}},
     },
     graphql: {
         command: "graphql-lsp",
         args: ["server", "-m", "stream"],
         fileTypes: [".graphql", ".gql"],
-        rootMarkers: [".graphqlrc", ".graphqlrc.json", ".graphqlrc.yaml", ".git"],
+        rootMarkers: [".graphqlrc",".graphqlrc.json",".graphqlrc.yaml",".git",".graphqlrc.yml","graphql.config.js"],
         installCmd: "npm install -g graphql-language-service-cli",
         uninstallCmd: "npm uninstall -g graphql-language-service-cli",
     },
     vimls: {
         command: "vim-language-server",
         args: ["--stdio"],
-        fileTypes: [".vim"],
+        fileTypes: [".vim",".vimrc"],
         rootMarkers: [".git"],
         installCmd: "npm install -g vim-language-server",
         uninstallCmd: "npm uninstall -g vim-language-server",
+        initOptions: {"isNeovim":true,"diagnostic":{"enable":true}},
     },
     omnisharp: {
         command: "omnisharp",
-        args: ["-lsp"],
-        fileTypes: [".cs"],
-        rootMarkers: ["*.sln", "*.csproj"],
+        args: ["-z","--hostPID","$PID","--encoding","utf-8","--languageserver"],
+        fileTypes: [".cs",".csx"],
+        rootMarkers: ["*.sln","*.csproj","omnisharp.json",".git"],
         installCmd: "brew install omnisharp",
         uninstallCmd: "brew uninstall omnisharp",
+        settings: {"FormattingOptions":{"EnableEditorConfigSupport":true},"RoslynExtensionsOptions":{"EnableAnalyzersSupport":true}},
     },
     "sourcekit-lsp": {
         command: "sourcekit-lsp",
         args: [],
         fileTypes: [".swift"],
-        rootMarkers: ["Package.swift", "*.xcodeproj", "*.xcworkspace"],
+        rootMarkers: ["Package.swift","*.xcodeproj","*.xcworkspace","project.yml",".swiftpm"],
         installCmd: "xcode-select --install",
     },
     swiftlint: {
         command: "swiftlint",
-        args: ["--lint"],
+        args: ["lint","--quiet","--reporter","json"],
         fileTypes: [".swift"],
-        rootMarkers: [".swiftlint.yml", "Package.swift"],
+        rootMarkers: [".swiftlint.yml","Package.swift",".swiftlint.yaml","*.xcodeproj"],
         isLinter: true,
         installCmd: "brew install swiftlint",
         uninstallCmd: "brew uninstall swiftlint",
+    },
+    expert: {
+        command: "expert",
+        args: ["--stdio"],
+        fileTypes: [".ex", ".exs", ".heex", ".eex"],
+        rootMarkers: ["mix.exs", "mix.lock"],
     },
     tlaplus: {
         command: "tlapm_lsp",
@@ -490,6 +521,8 @@ function isExecutableFile(candidate: string): boolean {
     }
 }
 
+const goBinDirectories = new Set<string>();
+
 export function findExecutable(command: string, cwd: string): string | undefined {
     if (!command) return undefined;
 
@@ -503,6 +536,12 @@ export function findExecutable(command: string, cwd: string): string | undefined
     while (true) {
         const candidate = join(cur, "node_modules", ".bin", command);
         if (isExecutableFile(candidate)) return candidate;
+        const localBins = [".venv/bin", ".venv/Scripts", "venv/bin", "venv/Scripts", ".env/bin", ".env/Scripts", "vendor/bundle/bin"];
+        if (["go.mod", "go.work", "Gemfile"].some((marker) => existsSync(join(cur, marker)))) localBins.push("bin");
+        for (const directory of localBins) {
+            const local = join(cur, directory, command + (process.platform === "win32" ? ".exe" : ""));
+            if (isExecutableFile(local)) return local;
+        }
         const parent = dirname(cur);
         if (parent === cur) break;
         cur = parent;
@@ -514,6 +553,15 @@ export function findExecutable(command: string, cwd: string): string | undefined
         : [""];
 
     for (const dir of pathDirs) {
+        if (!dir) continue;
+        for (const ext of pathext) {
+            const candidate = join(dir, command + ext);
+            if (isExecutableFile(candidate)) return candidate;
+        }
+    }
+    const userBins = [process.env.GOBIN, ...((process.env.GOPATH ?? join(homedir(), "go")).split(delimiter).slice(0, 1).map((path) => join(path, "bin"))), ...goBinDirectories,
+        join(homedir(), ".local", "bin"), join(homedir(), ".cargo", "bin"), join(homedir(), ".bun", "bin"), join(homedir(), ".dotnet", "tools")];
+    for (const dir of userBins) {
         if (!dir) continue;
         for (const ext of pathext) {
             const candidate = join(dir, command + ext);
@@ -819,7 +867,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
             env.PATH = `${binDirs.join(delimiter)}${delimiter}${env.PATH || ""}`;
         }
 
-        const proc = spawn(bin, config.args ?? [], {
+        const proc = spawn(bin, (config.args ?? []).map((arg) => arg === "$PID" ? String(process.pid) : arg), {
             cwd: resolvedCwd,
             stdio: ["pipe", "pipe", "pipe"],
             env,
@@ -1061,7 +1109,8 @@ export async function getServersForCwd(cwd: string) {
     const resolvedCwd = realpathSync(resolve(cwd));
     const list = await Promise.all(
         Object.entries(LSP_SERVERS).map(async ([id, conf]) => {
-            const available = findExecutable(conf.command, resolvedCwd) !== undefined;
+            const executable = findExecutable(conf.command, resolvedCwd);
+            const available = executable !== undefined;
             const matched = matchesMarkersOrExtensions(conf, resolvedCwd);
             const client = clients.get(`${id}:${resolvedCwd}`);
             const isRunning = client !== undefined && client.running === true;
@@ -1085,6 +1134,7 @@ export async function getServersForCwd(cwd: string) {
                 installCmd: conf.installCmd,
                 uninstallCmd: conf.uninstallCmd,
                 available,
+                executable,
                 matched,
                 checkedAt: Date.now(),
                 running: isRunning,
@@ -1314,7 +1364,21 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 return { ...row, running: client?.running === true, capabilities: client?.serverCapabilities ?? {}, instances: client?.running ? [{ cwd, diagnosticsCount: [...client.diagnostics.values()].reduce((sum, values) => sum + values.length, 0) }] : [] };
             });
         },
-        refreshServers: getServersForCwd,
+        async refreshServers(cwd, signal) {
+            const go = findExecutable("go", cwd);
+            if (go) {
+                try {
+                    const reply = await tooling.probeExecutable(go, ["env", "-json", "GOBIN", "GOPATH"], cwd, signal);
+                    const env = JSON.parse(reply.stdout);
+                    if (reply.exitCode === 0) {
+                        goBinDirectories.clear();
+                        if (typeof env.GOBIN === "string" && env.GOBIN) goBinDirectories.add(env.GOBIN);
+                        else if (typeof env.GOPATH === "string" && env.GOPATH) goBinDirectories.add(join(env.GOPATH.split(delimiter)[0], "bin"));
+                    }
+                } catch { /* Default/environment bin discovery remains available if Go cannot run. */ }
+            }
+            return getServersForCwd(cwd);
+        },
         config: (server) => Object.hasOwn(LSP_SERVERS, server) ? LSP_SERVERS[server] : undefined,
         version: (cwd, file, server) => {
             const uri = pathToFileURL(file).href;
@@ -1429,8 +1493,8 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.installCmd) throw web.error(400, "No install command available");
                 try {
-                    const { stdout, stderr } = await tooling.runCommand(conf.installCmd, process.cwd(), req.signal, () => { if (host.roleOf(req.user.id) !== "owner") throw new Error("Owner permission required"); });
-                    return { ok: true, output: stdout || stderr };
+                    const result = await tooling.manageRoute({ provider: "lsp", action: "install", serverId }, req);
+                    return { ...result, ok: result.status === "ok" };
                 } catch (err: unknown) {
                     throw web.error(500, err instanceof Error ? err.message : String(err));
                 }
@@ -1447,8 +1511,8 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.uninstallCmd) throw web.error(400, "No uninstall command available");
                 try {
-                    const { stdout, stderr } = await tooling.runCommand(conf.uninstallCmd, process.cwd(), req.signal, () => { if (host.roleOf(req.user.id) !== "owner") throw new Error("Owner permission required"); });
-                    return { ok: true, output: stdout || stderr };
+                    const result = await tooling.manageRoute({ provider: "lsp", action: "uninstall", serverId }, req);
+                    return { ...result, ok: result.status === "ok" };
                 } catch (err: unknown) {
                     throw web.error(500, err instanceof Error ? err.message : String(err));
                 }
@@ -1609,11 +1673,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                     await startServer(args.server, conf, resolvedCwd);
                     return { output: [{ type: "text" as const, text: `Started ${args.server} for ${resolvedCwd}` }] };
                 case "install":
-                case "uninstall": {
-                    const command = args.action === "install" ? conf.installCmd : conf.uninstallCmd;
-                    if (!command) throw new Error(`No ${args.action} command for ${args.server}`);
-                    const { stdout, stderr } = await tooling.runCommand(command, resolvedCwd, context.abortSignal, () => assertOwner(host, api.conversationId, "manage language servers"));
-                    return { output: [{ type: "text" as const, text: `${args.action === "install" ? "Installed" : "Uninstalled"}:\n${stdout || stderr}` }] };
+                case "uninstall":
+                case "refresh": {
+                    const result = await tooling.manage({ provider: "lsp", action: args.action, serverId: args.server }, api, context);
+                    return { isError: result.status === "failed" || result.status === "partial", output: [{ type: "text" as const, text: JSON.stringify(result) }] };
                 }
                 default:
                     throw new Error("Unsupported language-server action");
@@ -1669,16 +1732,20 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                     if ((call.name !== "edit" && call.name !== "write") || result.isError
                         || result.diagnostics?.some((diagnostic) => diagnostic.severity === "error"
                             || (typeof diagnostic.code === "string" && Object.hasOwn(INCOMPLETE_TOOL_RESULTS, diagnostic.code)))
-                        || context.abortSignal?.aborted || !isOwner(host, api.conversationId)
-                        || web?.setting("autoCheck") === false) return undefined;
+                        || context.abortSignal?.aborted || !isOwner(host, api.conversationId)) return undefined;
                     const file = typeof call.arguments.path === "string" ? call.arguments.path : "";
                     if (!file) return undefined;
                     const cwd = host.cwdOf(api.conversationId);
                     if (workspaceScheme(cwd)) return undefined;
                     const resolvedCwd = resolve(cwd);
                     const absolute = resolve(resolvedCwd, file);
-                    tooling.changed(resolvedCwd, [absolute]);
                     if (basename(absolute).startsWith(".env")) return undefined;
+                    try {
+                        const within = relative(realpathSync(resolvedCwd), realpathSync(absolute));
+                        if (within === ".." || within.startsWith(`..${sep}`)) return undefined;
+                        tooling.changed(realpathSync(resolvedCwd), [absolute], host.requesterOf(api.conversationId));
+                    } catch { return undefined; }
+                    if (web?.setting("autoCheck") === false) return undefined;
                     const ext = extname(absolute).toLowerCase();
                     if (!Object.values(LSP_SERVERS).some((config) => config.fileTypes.some((fileType) => fileType.toLowerCase() === ext))) return undefined;
                     let summary: string;

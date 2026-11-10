@@ -4,8 +4,10 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
-import { GraphProvider } from "./pi-lsp/v1.3.1/graph.ts";
-import { createProcessRunner } from "./pi-lsp/v1.3.1/process.ts";
+import { GraphProvider } from "./pi-lsp/v1.3.2/graph.ts";
+import { createProcessRunner } from "./pi-lsp/v1.3.2/process.ts";
+import { createAutomaticProviders } from "./pi-lsp/v1.3.2/automatic.ts";
+import { createSourceWatchers } from "./pi-lsp/v1.3.2/watch.ts";
 const find = (command: string) => (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, command)).find((path) => existsSync(path));
 const binary = find("codegraph");
 async function fixture(run: (root: string, graph: GraphProvider, setOwner: (value: boolean) => void) => Promise<void>) {
@@ -79,4 +81,46 @@ test("explicit graph rebuild recovers an uninitialized directory without deletin
     assert.equal(rebuilt.initialized, true, rebuilt.error);
     assert.equal(rebuilt.buildState, "complete", rebuilt.error);
     assert.equal(await readFile(join(directory, "owner.note"), "utf8"), "keep this metadata");
+}));
+
+test("real source watcher syncs external additions, edits and removals without DB feedback", { skip: !binary }, async () => fixture(async (root, graph) => {
+    const built = await graph.operate(root, { action: "create" }); assert.equal(built.buildState, "complete", built.error);
+    let active = true, watcherError = "";
+    const watchers = createSourceWatchers({ isOwner: () => active, changed: (cwd, person, files) => { graph.markChanged(cwd, files); automatic.changed(cwd, person, files); }, failed: (_cwd, error) => { watcherError = error; } });
+    const automatic = createAutomaticProviders({ isOwner: () => active, canOperate: () => true, notify() {},
+        probe: async (cwd, _person, signal) => { const found = await graph.probe(cwd, signal); watchers.ensure(cwd, "owner", found.initialized === true); return { indexed: found.initialized === true }; },
+        sync: async (cwd, _person, signal) => { const result = await graph.operate(cwd, { action: "sync" }, signal); if (result.error) throw new Error(result.error); },
+    });
+    const waitForSync = async (generation: unknown) => {
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline) {
+            const status = graph.cachedStatus(root);
+            if (status.generation !== generation && status.sourceFreshness === "checked_current" && status.lastOperation?.state === "complete") return;
+            await new Promise<void>((wake) => setTimeout(wake, 25));
+        }
+        throw new Error(`External change was not synchronized: ${JSON.stringify(graph.cachedStatus(root))}`);
+    };
+    try {
+        await automatic.prepareQuery(root, "owner"); assert.equal(watcherError, "");
+        const initial = graph.cachedStatus(root).generation;
+        await writeFile(join(root, "external.ts"), "export function externalAdded() { return 42; }\n");
+        await writeFile(join(root, "math.ts"), "export function externalRenamed(value: number) { return value * 3; }\n");
+        await waitForSync(initial);
+        const added = await graph.query(root, { action: "explore", query: "externalAdded" });
+        assert.match(JSON.stringify(added.items), /externalAdded/);
+        const renamed = await graph.query(root, { action: "explore", query: "externalRenamed" });
+        assert.match(JSON.stringify(renamed.items), /externalRenamed/);
+        const beforeRemoval = graph.cachedStatus(root).generation;
+        await rm(join(root, "external.ts")); await waitForSync(beforeRemoval);
+        const removed = await graph.query(root, { action: "callers", symbol: "externalAdded" }); assert.equal(removed.status, "empty");
+        await new Promise<void>((wake) => setTimeout(wake, 700));
+        const idle = graph.cachedStatus(root).lastOperation?.completedAt;
+        await writeFile(join(root, ".codegraph", "owner.note"), "not a source change");
+        await new Promise<void>((wake) => setTimeout(wake, 700));
+        assert.equal(graph.cachedStatus(root).lastOperation?.completedAt, idle, "Index writes must not cause a sync loop");
+        active = false;
+        await writeFile(join(root, "math.ts"), "export function revokedOwnerChange() { return 1; }\n");
+        await new Promise<void>((wake) => setTimeout(wake, 500));
+        assert.equal(graph.cachedStatus(root).lastOperation?.completedAt, idle);
+    } finally { watchers.dispose(); await automatic.dispose(); }
 }));

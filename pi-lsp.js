@@ -36,7 +36,7 @@ const displayValue = (value, depth = 0) => {
     if (typeof value === "string") return value.slice(0, 600);
     if (typeof value === "boolean") return value ? "Yes" : "No";
     if (typeof value === "number") return String(value);
-    if (depth >= 2) return "Details available from provider";
+    if (depth >= 2) return JSON.stringify(value).slice(0, 600);
     if (Array.isArray(value)) {
         const text = value.slice(0, 12).map((item) => displayValue(item, depth + 1)).join(", ");
         return `${text || "None"}${value.length > 12 ? " …" : ""}`.slice(0, 600);
@@ -46,6 +46,15 @@ const displayValue = (value, depth = 0) => {
             .map(([key, item]) => `${key}: ${displayValue(item, depth + 1)}`).join("; ").slice(0, 600) || "None";
     }
     return "Unknown";
+};
+const operationOutcome = (result) => {
+    const details = [result?.message ?? `${result?.action ?? "Operation"}: ${result?.status ?? "unknown"}`];
+    if (result?.executable) details.push(`Executable: ${result.executable}`);
+    if (result?.version) details.push(`Version: ${result.version}`);
+    if (result?.installer) details.push(`Installer exit: ${result.installer.exitCode ?? "unknown"}${result.installer.stderr ? ` · ${result.installer.stderr}` : ""}`);
+    const stats = result?.operationResult;
+    if (stats) details.push(`Files: +${stats.filesAdded ?? 0} ~${stats.filesModified ?? stats.filesIndexed ?? 0} -${stats.filesRemoved ?? 0}; errors: ${stats.filesErrored ?? 0}`);
+    return details.join("\n").slice(0, 4000);
 };
 const displayTime = (value) => {
     if (value === undefined || value === null) return "Not checked";
@@ -233,7 +242,8 @@ export default function setup(pocket) {
                 const result = await pocket.api(toolingPath(conversationId, "execute"),
                     { provider, action, ...extra }, { signal: stop.signal });
                 if (!current(stop)) return;
-                if (action !== "refresh") setOutcome(displayValue(result));
+                if (action !== "refresh" || result?.status === "failed" || result?.status === "partial") setOutcome(operationOutcome(result));
+                if (result?.status === "failed" || result?.status === "partial") setActionError(result?.error ?? result?.message ?? "Operation did not complete");
                 setRefresh((value) => value + 1);
                 updateStatus();
             } catch (failure) { failOperation(stop, failure); }
@@ -271,6 +281,8 @@ export default function setup(pocket) {
             ${field("Trust policy", status?.trustPolicy ?? status?.configPolicy ?? status?.configuration ?? status?.parserPolicy)}
             ${field("Provider checked at", displayTime(status?.checkedAt))}
             ${status?.error ? html`<div class="error-box" role="alert">${displayValue(status.error)}</div>` : ""}
+            ${status?.automaticError ? html`<div class="error-box" role="alert">${status.automaticError}</div>` : ""}
+            ${provider === "graph" ? field("Automatic sync", status?.automaticSync) : ""}
             <div style=${ROW_STYLE}>
                 ${button("Refresh", () => runOperation(provider, "refresh"))}
                 ${status?.canInstall || status?.installCmd ? button("Install", () => runOperation(provider, "install")) : ""}
@@ -298,7 +310,7 @@ export default function setup(pocket) {
                 <button class="button" onClick=${() => setRefresh((value) => value + 1)}>Retry cached status</button></div>` : ""}
             ${busy || snapshot?.busy ? html`<p role="status">${busy || displayValue(snapshot.busy)} · awaited operation; navigation cancels this request.</p>` : ""}
             ${actionError ? html`<div class="error-box" role="alert">${actionError}</div>` : ""}
-            ${outcome ? html`<div style=${CARD_STYLE} role="status">Operation outcome: ${outcome}</div>` : ""}
+            ${outcome ? html`<div style=${CARD_STYLE} role="status"><strong>Operation outcome</strong><div style="white-space: pre-wrap;">${outcome}</div></div>` : ""}
             ${snapshot && tab === "Overview" ? html`<div role="tabpanel" aria-label="Overview" style="margin-top: 0.8rem;">
                 <div style=${CARD_STYLE}><strong>LSP</strong>${field("Active servers", servers.filter((server) => server.running).length)}
                     ${field("Detected project matches", servers.some((server) => server.matched === null || server.matched === undefined)
