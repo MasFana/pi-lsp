@@ -1,9 +1,9 @@
-// pi-lsp browser module: status indicators, detection, and package installer/uninstaller dashboard.
+// One cached Tooling dashboard; provider operations require an exact owner confirmation.
 export const pocketApi = 2;
 
 const CODE_ICON_PATH = "M16 18l6-6-6-6 M8 6l-6 6 6 6";
-
 const safeStr = (value) => (typeof value === "string" ? value.trim() : "");
+const shortStr = (value) => safeStr(value).slice(0, 240);
 const parsePos = (value) => {
     if (Number.isInteger(value) && value >= 0) return value + 1;
     if (typeof value === "string" && /^\d+$/.test(value.trim())) {
@@ -13,278 +13,439 @@ const parsePos = (value) => {
     return null;
 };
 const MANAGE_LABELS = {
-    start: "start language server",
-    stop: "stop language server",
-    install: "install language server",
-    uninstall: "uninstall language server",
+    start: "start language server", stop: "stop language server",
+    install: "install language server", uninstall: "uninstall language server",
 };
+const QUERY_LABELS = {
+    references: "find references", hover: "inspect symbol",
+    document_symbols: "outline document", workspace_symbols: "find workspace symbols",
+    implementation: "find implementations", code_actions: "inspect code actions",
+    rename_preview: "preview semantic rename", format_preview: "preview formatting",
+};
+const AST_LABELS = {
+    status: "check AST status", search: "search syntax", outline: "outline syntax",
+    rewrite_preview: "preview structural rewrite",
+};
+const GRAPH_LABELS = {
+    status: "check cached graph status", explore: "explore indexed code",
+    callers: "find indexed callers", callees: "find indexed callees",
+    impact: "inspect indexed impact", affected_tests: "find test candidates",
+};
+const displayValue = (value, depth = 0) => {
+    if (value === undefined || value === null || value === "") return "Unknown";
+    if (typeof value === "string") return value.slice(0, 600);
+    if (typeof value === "boolean") return value ? "Yes" : "No";
+    if (typeof value === "number") return String(value);
+    if (depth >= 2) return "Details available from provider";
+    if (Array.isArray(value)) {
+        const text = value.slice(0, 12).map((item) => displayValue(item, depth + 1)).join(", ");
+        return `${text || "None"}${value.length > 12 ? " …" : ""}`.slice(0, 600);
+    }
+    if (typeof value === "object") {
+        return Object.entries(value).slice(0, 12)
+            .map(([key, item]) => `${key}: ${displayValue(item, depth + 1)}`).join("; ").slice(0, 600) || "None";
+    }
+    return "Unknown";
+};
+const displayTime = (value) => {
+    if (value === undefined || value === null) return "Not checked";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString();
+};
+const serverAvailability = (server) => typeof server.available === "boolean" ? server.available
+    : typeof server.installed === "boolean" ? server.installed : null;
+const cachedAvailability = (status) => status?.checkedAt === undefined && !status?.executable && !status?.version
+    ? "Not checked" : status?.available;
+const messageOf = (failure) => shortStr(failure?.message) || "The request failed; status is unknown.";
+const CARD_STYLE = "border: 1px solid var(--border, #333); border-radius: 6px; padding: 0.75rem; margin-bottom: 0.65rem; overflow-wrap: anywhere;";
+const ROW_STYLE = "display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;";
+
 export default function setup(pocket) {
     const { html, useEffect, useRef, useState } = pocket;
-    const serverPath = (cid) => cid === null ? "servers" : `c/${cid}/servers`;
+    const toolingPath = (cid, action = "status") => cid === null
+        ? `tooling/${action}` : `c/${cid}/tooling/${action}`;
+    const registrations = [];
+    const cleanups = new Set();
+    const controllers = new Set();
+    let disposed = false;
+    const ownCleanup = (fn) => {
+        let active = true;
+        const cleanup = () => {
+            if (!active) return;
+            active = false;
+            cleanups.delete(cleanup);
+            fn();
+        };
+        cleanups.add(cleanup);
+        return cleanup;
+    };
+    const newController = () => {
+        const stop = new AbortController();
+        controllers.add(stop);
+        return stop;
+    };
+    const abortRequests = () => {
+        for (const stop of controllers) stop.abort();
+        controllers.clear();
+    };
+    const isOwner = () => pocket.me()?.role === "owner";
 
-    function LspSheet() {
-        const [servers, setServers] = useState([]);
-        const [cwd, setCwd] = useState("");
+    function ToolingSheet() {
+        const [snapshot, setSnapshot] = useState(null);
         const [loading, setLoading] = useState(true);
-        const [filter, setFilter] = useState("detected"); // detected | running | all
-        const [busy, setBusy] = useState({});
+        const [tab, setTab] = useState("Overview");
+        const [filter, setFilter] = useState("detected");
+        const [busy, setBusy] = useState("");
         const [error, setError] = useState("");
         const [actionError, setActionError] = useState("");
+        const [outcome, setOutcome] = useState("");
+        const [confirmation, setConfirmation] = useState(null);
+        const [consented, setConsented] = useState(false);
+        const [clock, setClock] = useState(Date.now());
         const [conversationId, setConversationId] = useState(pocket.conversationId());
         const [refresh, setRefresh] = useState(0);
-        const actions = useRef(new Map());
+        const operation = useRef(null);
+        const plan = useRef(null);
         const loadedFor = useRef(undefined);
+        const owner = isOwner();
+        const cwd = safeStr(snapshot?.cwd);
 
-        useEffect(() => pocket.onConversation(setConversationId), []);
         useEffect(() => {
-            return pocket.on("lsp-changed", (evt) => {
-                const eventCwd = evt && typeof evt === "object" && typeof evt.cwd === "string" ? evt.cwd : "";
-                if (eventCwd && cwd && eventCwd !== cwd) return;
-                setRefresh((r) => r + 1);
+            const cancel = () => {
+                operation.current?.abort();
+                if (operation.current) controllers.delete(operation.current);
+                operation.current = null;
+                plan.current = null;
+                setConfirmation(null);
+                setConsented(false);
+                setBusy("");
+            };
+            const navigation = () => { cancel(); setRefresh((value) => value + 1); };
+            const stopConversation = pocket.onConversation((cid) => {
+                if (cid !== conversationId) cancel();
+                setConversationId(cid);
             });
+            window.addEventListener("pagehide", cancel);
+            window.addEventListener("popstate", navigation);
+            window.addEventListener("offline", cancel);
+            window.addEventListener("pageshow", navigation);
+            window.addEventListener("online", navigation);
+            return ownCleanup(() => {
+                stopConversation();
+                window.removeEventListener("pagehide", cancel);
+                window.removeEventListener("popstate", navigation);
+                window.removeEventListener("offline", cancel);
+                window.removeEventListener("pageshow", navigation);
+                window.removeEventListener("online", navigation);
+                cancel();
+            });
+        }, [conversationId]);
+
+        useEffect(() => {
+            if (!plan.current || plan.current.cwd === cwd) return;
+            operation.current?.abort();
+            if (operation.current) controllers.delete(operation.current);
+            operation.current = null;
+            plan.current = null;
+            setConfirmation(null);
+            setConsented(false);
+            setBusy("");
+            setActionError("Workspace changed; prepare a new confirmation before executing.");
+        }, [cwd]);
+
+        useEffect(() => {
+            const changed = (evt) => {
+                if (disposed) return;
+                const eventCwd = safeStr(evt?.cwd);
+                if (eventCwd && cwd && eventCwd !== cwd) return;
+                setRefresh((value) => value + 1);
+            };
+            const stopLsp = pocket.on("lsp-changed", changed);
+            return ownCleanup(stopLsp);
         }, [conversationId, cwd]);
 
         useEffect(() => {
-            const stop = new AbortController();
+            const stop = newController();
             let reading = false;
             if (loadedFor.current !== conversationId) {
                 loadedFor.current = conversationId;
-                setServers([]);
-                setCwd("");
+                setSnapshot(null);
                 setActionError("");
+                setOutcome("");
                 setLoading(true);
             }
-            setError("");
-            const fetchServers = async () => {
-                if (reading) return;
+            const readCachedStatus = async () => {
+                if (reading || stop.signal.aborted || disposed) return;
                 reading = true;
                 try {
-                    const data = await pocket.api(serverPath(conversationId), undefined, { signal: stop.signal });
-                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
-                        setServers(data.servers);
-                        setCwd(data.cwd);
+                    const data = await pocket.api(toolingPath(conversationId), undefined, { signal: stop.signal });
+                    if (!stop.signal.aborted && !disposed && pocket.conversationId() === conversationId) {
+                        if (!data || typeof data.cwd !== "string" || !Array.isArray(data.servers)) {
+                            throw new Error("Invalid cached Tooling status response.");
+                        }
+                        setSnapshot(data);
                         setError("");
                     }
                 } catch (failure) {
-                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
-                        setError(failure.message);
+                    if (!stop.signal.aborted && !disposed && pocket.conversationId() === conversationId) {
+                        setError(messageOf(failure));
                     }
                 } finally {
                     reading = false;
-                    if (!stop.signal.aborted && pocket.conversationId() === conversationId) setLoading(false);
+                    if (!stop.signal.aborted && !disposed && pocket.conversationId() === conversationId) setLoading(false);
                 }
             };
-            fetchServers();
-            const interval = setInterval(fetchServers, 8000);
-            return () => {
+            readCachedStatus();
+            const interval = setInterval(readCachedStatus, 15000);
+            return ownCleanup(() => {
                 stop.abort();
+                controllers.delete(stop);
                 clearInterval(interval);
-            };
+            });
         }, [conversationId, refresh]);
 
         useEffect(() => {
-            setBusy({});
-            return () => {
-                for (const stop of actions.current.values()) stop.abort();
-                actions.current.clear();
-            };
-        }, [conversationId]);
+            if (!confirmation) return;
+            setClock(Date.now());
+            const interval = setInterval(() => setClock(Date.now()), 1000);
+            return ownCleanup(() => clearInterval(interval));
+        }, [confirmation]);
 
-        const runAction = async (action, serverId) => {
-            if (!cwd || pocket.conversationId() !== conversationId || actions.current.has(serverId)) return;
-            const stop = new AbortController();
-            actions.current.set(serverId, stop);
-            setBusy((b) => ({ ...b, [serverId]: action }));
+        const current = (stop) => !disposed && !stop.signal.aborted
+            && pocket.conversationId() === conversationId && operation.current === stop;
+        const locked = Boolean(busy || confirmation || snapshot?.busy || error || loading);
+        const startOperation = (label) => {
+            if (!isOwner() || !cwd || error || operation.current || plan.current || snapshot?.busy
+                || pocket.conversationId() !== conversationId || disposed) return null;
+            const stop = newController();
+            operation.current = stop;
+            setBusy(label);
             setActionError("");
-            const bound = conversationId !== null && (action === "start" || action === "stop");
+            setOutcome("");
+            return stop;
+        };
+        const finishOperation = (stop) => {
+            controllers.delete(stop);
+            if (operation.current === stop) {
+                operation.current = null;
+                if (!disposed && !stop.signal.aborted && pocket.conversationId() === conversationId) setBusy("");
+            }
+        };
+        const failOperation = (stop, failure) => {
+            if (!current(stop)) return;
+            const message = messageOf(failure);
+            setActionError(message);
+            setRefresh((value) => value + 1);
+            pocket.notify("error", `Tooling operation failed: ${message}`);
+        };
+        const prepare = async (provider, action, extra = {}) => {
+            const stop = startOperation(`Preparing ${action}`);
+            if (!stop) return;
             try {
+                const data = await pocket.api(toolingPath(conversationId, "prepare"),
+                    { provider, action, ...extra }, { signal: stop.signal });
+                if (!current(stop)) return;
+                if (!safeStr(data?.token) || !safeStr(data?.title) || !safeStr(data?.command)
+                    || !safeStr(data?.warning) || !Number.isFinite(data?.expiresAt)) {
+                    throw new Error("Invalid confirmation plan; nothing was executed.");
+                }
+                const prepared = { ...data, conversationId, cwd };
+                plan.current = prepared;
+                setConsented(false);
+                setClock(Date.now());
+                setConfirmation(prepared);
+            } catch (failure) {
+                failOperation(stop, failure);
+            } finally {
+                finishOperation(stop);
+            }
+        };
+        const cancelConfirmation = () => {
+            if (operation.current) return;
+            plan.current = null;
+            setConfirmation(null);
+            setConsented(false);
+        };
+        const execute = async () => {
+            const prepared = plan.current;
+            if (!isOwner() || !consented || !prepared || prepared !== confirmation || operation.current || snapshot?.busy
+                || prepared.conversationId !== pocket.conversationId() || prepared.cwd !== cwd
+                || prepared.expiresAt <= Date.now() || error || disposed) return;
+            const stop = newController();
+            operation.current = stop;
+            setBusy("Executing confirmed operation");
+            setActionError("");
+            try {
+                const result = await pocket.api(toolingPath(conversationId, "execute"),
+                    { token: prepared.token, confirmed: true }, { signal: stop.signal });
+                if (!current(stop)) return;
+                setOutcome(displayValue(result));
+                setRefresh((value) => value + 1);
+                updateStatus();
+            } catch (failure) {
+                failOperation(stop, failure);
+            } finally {
+                if (current(stop)) {
+                    plan.current = null;
+                    setConfirmation(null);
+                    setConsented(false);
+                }
+                finishOperation(stop);
+            }
+        };
+        const runLifecycle = async (action, serverId) => {
+            const stop = startOperation(`${action} ${serverId}`);
+            if (!stop) return;
+            try {
+                const bound = conversationId !== null;
                 await pocket.api(bound ? `c/${conversationId}/${action}` : action,
                     bound ? { serverId } : { serverId, cwd }, { signal: stop.signal });
-                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
+                if (current(stop)) {
                     setRefresh((value) => value + 1);
                     updateStatus();
                 }
             } catch (failure) {
-                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
-                    setActionError(failure.message);
-                    pocket.notify("error", `LSP ${action} failed: ${failure.message}`);
-                }
+                failOperation(stop, failure);
             } finally {
-                if (actions.current.get(serverId) === stop) actions.current.delete(serverId);
-                if (!stop.signal.aborted && pocket.conversationId() === conversationId) {
-                    setBusy((b) => ({ ...b, [serverId]: null }));
-                }
+                finishOperation(stop);
             }
         };
-
-        if (loading) {
-            return html`<div style="padding: 1.5rem; color: var(--text-dim, #888);">Loading LSP status...</div>`;
-        }
-
-        if (error) {
-            return html`<div style="padding: 1rem;">
-                <div class="error-box" role="alert">${error}</div>
-                <button class="button" onClick=${() => setRefresh((value) => value + 1)}>Retry LSP status</button>
-            </div>`;
-        }
-
-        const filtered = servers.filter((s) => {
-            if (filter === "running") return s.running;
-            if (filter === "detected") return s.matched || s.running;
-            return true;
-        });
-
-        return html`
-            <div style="padding: 1rem; font-family: inherit; font-size: 0.85rem; height: 100%; display: flex; flex-direction: column;">
-                <div style="margin-bottom: 1rem; display: flex; align-items: center; justify-content: space-between;">
-                    <div>
-                        <div style="font-size: 0.75rem; color: var(--text-dim, #888); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                            ${cwd}
-                        </div>
-                    </div>
-                    <div style="display: flex; gap: 4px;">
-                        <button
-                            onClick=${() => setFilter("detected")}
-                            style="background: ${filter === "detected" ? "var(--border, #444)" : "transparent"}; border: 1px solid var(--border, #444); color: inherit; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer;"
-                        >
-                            Detected
-                        </button>
-                        <button
-                            onClick=${() => setFilter("running")}
-                            style="background: ${filter === "running" ? "var(--border, #444)" : "transparent"}; border: 1px solid var(--border, #444); color: inherit; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer;"
-                        >
-                            Running
-                        </button>
-                        <button
-                            onClick=${() => setFilter("all")}
-                            style="background: ${filter === "all" ? "var(--border, #444)" : "transparent"}; border: 1px solid var(--border, #444); color: inherit; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer;"
-                        >
-                            All
-                        </button>
-                    </div>
-                </div>
-
-                ${actionError ? html`<div class="error-box" role="alert">${actionError}</div>` : ""}
-                <div style="display: flex; flex-direction: column; gap: 0.6rem; overflow-y: auto; flex: 1;">
-                    ${filtered.length === 0
-                        ? html`<div class="muted" style="font-size: 0.85rem; padding: 1rem 0;">${filter === "running"
-                            ? "No language servers running for this workspace."
-                            : filter === "detected"
-                              ? `No project matches in this workspace. Click All to browse ${servers.length} supported servers.`
-                              : "No language servers returned."}</div>`
-                        : filtered.map((s) => {
-                              const isRunning = s.running;
-                              const isBusy = busy[s.id];
-
-                              return html`
-                                  <div
-                                      style="border: 1px solid var(--border, #333); border-radius: 6px; padding: 0.65rem; background: var(--card-bg, rgba(255,255,255,0.02));"
-                                  >
-                                      <div style="display: flex; justify-content: space-between; align-items: center;">
-                                          <div style="display: flex; align-items: center; gap: 6px;">
-                                              <span
-                                                  style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: ${isRunning
-                                                      ? "var(--success, #22c55e)"
-                                                      : s.available
-                                                        ? "var(--accent, #3b82f6)"
-                                                        : "var(--text-dim, #555)"};"
-                                              ></span>
-                                              <strong>${s.id}</strong>
-                                              ${s.isLinter ? html`<span style="font-size: 0.65rem; color: var(--accent, #3b82f6); border: 1px solid var(--border, #444); border-radius: 3px; padding: 0 3px;">linter</span>` : ""}
-                                          </div>
-                                          <span style="font-size: 0.75rem; color: var(--text-dim, #888);">${s.command}</span>
-                                      </div>
-
-                                      <div style="margin-top: 0.4rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem;">
-                                          <span style="color: var(--text-dim, #888);">
-                                              Types: ${s.fileTypes.slice(0, 3).join(", ")}${s.fileTypes.length > 3 ? "…" : ""}
-                                          </span>
-                                          <div style="display: flex; gap: 6px; align-items: center;">
-                                              ${isRunning
-                                                  ? html`
-                                                        <button
-                                                            disabled=${Boolean(isBusy)}
-                                                            onClick=${() => runAction("stop", s.id)}
-                                                            style="background: transparent; border: 1px solid var(--danger, #ef4444); color: var(--danger, #ef4444); border-radius: 3px; font-size: 0.7rem; padding: 2px 6px; cursor: pointer;"
-                                                        >
-                                                            ${isBusy === "stop" ? "..." : "Stop"}
-                                                        </button>
-                                                    `
-                                                  : s.available
-                                                    ? html`
-                                                          <button
-                                                              disabled=${Boolean(isBusy)}
-                                                              onClick=${() => runAction("start", s.id)}
-                                                              style="background: transparent; border: 1px solid var(--success, #22c55e); color: var(--success, #22c55e); border-radius: 3px; font-size: 0.7rem; padding: 2px 6px; cursor: pointer;"
-                                                          >
-                                                              ${isBusy === "start" ? "..." : "Start"}
-                                                          </button>
-                                                      `
-                                                    : html`
-                                                          ${s.installCmd
-                                                              ? html`
-                                                                    <button
-                                                                        disabled=${Boolean(isBusy)}
-                                                                        onClick=${() => runAction("install", s.id)}
-                                                                        style="background: transparent; border: 1px solid var(--accent, #3b82f6); color: var(--accent, #3b82f6); border-radius: 3px; font-size: 0.7rem; padding: 2px 6px; cursor: pointer;"
-                                                                    >
-                                                                        ${isBusy === "install" ? "Installing..." : "Install"}
-                                                                    </button>
-                                                                `
-                                                              : html`<span style="color: var(--text-dim, #666);">Not installed</span>`}
-                                                      `}
-                                              ${s.available && s.uninstallCmd && !isRunning
-                                                  ? html`
-                                                        <button
-                                                            disabled=${Boolean(isBusy)}
-                                                            onClick=${() => runAction("uninstall", s.id)}
-                                                            style="background: transparent; border: 1px solid var(--border, #555); color: var(--text-dim, #888); border-radius: 3px; font-size: 0.7rem; padding: 2px 6px; cursor: pointer;"
-                                                        >
-                                                            ${isBusy === "uninstall" ? "..." : "Uninstall"}
-                                                        </button>
-                                                    `
-                                                  : ""}
-                                          </div>
-                                      </div>
-                                  </div>
-                              `;
-                          })}
-                </div>
+        const field = (label, value) => html`<div style="margin-top: 0.3rem;"><span class="muted">${label}: </span>${displayValue(value)}</div>`;
+        const button = (label, run, disabled = false) => html`<button class="button" disabled=${!owner || locked || disabled} onClick=${run}>${label}</button>`;
+        const providerCard = (provider, status) => html`<div style=${CARD_STYLE}>
+            <strong>${provider === "ast" ? "AST · ast-grep" : "CodeGraph"}</strong>
+            ${field("Installed / detected", cachedAvailability(status))}
+            ${field("Version", status?.version)}
+            ${field("Executable", status?.executable)}
+            ${field("Provenance", status?.provenance)}
+            ${field("Runtime", status?.runtime)}
+            ${field("Runtime version", status?.runtimeVersion)}
+            ${field("Runtime compatible", status?.compatible)}
+            ${field("Capabilities", status?.actions)}
+            ${field("Trust policy", status?.trustPolicy ?? status?.configPolicy ?? status?.configuration ?? status?.parserPolicy)}
+            ${field("Provider checked at", displayTime(status?.checkedAt))}
+            ${status?.error ? html`<div class="error-box" role="alert">${displayValue(status.error)}</div>` : ""}
+            <div style=${ROW_STYLE}>
+                ${button("Refresh", () => prepare(provider, "refresh"))}
+                ${status?.canInstall || status?.installCmd ? button("Install", () => prepare(provider, "install")) : ""}
+                ${status?.canUninstall || status?.uninstallCmd ? button("Uninstall", () => prepare(provider, "uninstall")) : ""}
             </div>
-        `;
+        </div>`;
+
+        const servers = snapshot?.servers || [];
+        const ast = snapshot?.ast;
+        const graph = snapshot?.graph;
+        const indexExists = graph?.checkedAt === undefined ? "Not checked" : graph?.initialized;
+        const filtered = servers.filter((server) => filter === "running" ? server.running
+            : filter === "detected" ? server.matched !== false || server.running : true);
+        const expired = confirmation && confirmation.expiresAt <= clock;
+
+        return html`<div style="padding: 1rem; font-size: 0.85rem; height: 100%; overflow-y: auto;">
+            <div style="overflow-wrap: anywhere;"><strong>Tooling</strong>${field("Workspace", cwd || (loading ? "Loading" : "Unknown"))}</div>
+            <p class="muted">Cached status only · polls every 15 seconds. Refresh is an explicit owner operation.</p>
+            <div role="tablist" aria-label="Tooling providers" style=${ROW_STYLE}>
+                ${["Overview", "LSP", "AST", "CodeGraph"].map((name) => html`<button class="button" role="tab"
+                    aria-selected=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}
+            </div>
+            ${!owner ? html`<p class="muted">Owner permission is required to manage providers or apply proposals.</p>` : ""}
+            ${loading ? html`<p class="muted">Loading cached Tooling status...</p>` : ""}
+            ${error ? html`<div class="error-box" role="alert">${error}<br />Cached values may be out of date.
+                <button class="button" onClick=${() => setRefresh((value) => value + 1)}>Retry cached status</button></div>` : ""}
+            ${busy || snapshot?.busy ? html`<p role="status">${busy || displayValue(snapshot.busy)} · awaited operation; navigation cancels this request.</p>` : ""}
+            ${actionError ? html`<div class="error-box" role="alert">${actionError}</div>` : ""}
+            ${outcome ? html`<div style=${CARD_STYLE} role="status">Operation outcome: ${outcome}</div>` : ""}
+            ${confirmation ? html`<div style=${CARD_STYLE} role="region" aria-label="Confirm exact Tooling operation">
+                <strong>${confirmation.title}</strong>
+                ${field("Workspace", confirmation.cwd)}
+                <pre style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto;">${confirmation.command}</pre>
+                ${confirmation.npmRoot ? field("Global npm package root", confirmation.npmRoot) : ""}
+                ${Array.isArray(confirmation.preview) ? confirmation.preview.map((item) => html`<div style=${CARD_STYLE}><strong>${shortStr(item.file)}</strong><pre style="white-space: pre-wrap; max-height: 12rem; overflow: auto;">${item.diff}</pre>${item.truncated ? html`<p class="muted">Diff preview truncated; inspect the full source before approval.</p>` : ""}</div>`) : ""}
+                <div class="error-box">${confirmation.warning}</div>
+                <p class="muted">Expires ${displayTime(confirmation.expiresAt)}${expired ? " · expired; prepare again" : ""}</p>
+                <label style=${ROW_STYLE}><input type="checkbox" checked=${consented} disabled=${Boolean(busy)}
+                    onChange=${(event) => setConsented(event.currentTarget.checked)} />
+                    I approve this exact operation and understand it runs unsandboxed.</label>
+                <div style=${ROW_STYLE}><button class="button" disabled=${!owner || !consented || Boolean(busy) || expired || Boolean(error) || Boolean(snapshot?.busy) || confirmation.cwd !== cwd}
+                    onClick=${execute}>Confirm and execute</button>
+                    <button class="button" disabled=${Boolean(busy)} onClick=${cancelConfirmation}>Cancel</button></div>
+            </div>` : ""}
+            ${snapshot && tab === "Overview" ? html`<div role="tabpanel" aria-label="Overview" style="margin-top: 0.8rem;">
+                <div style=${CARD_STYLE}><strong>LSP</strong>${field("Active servers", servers.filter((server) => server.running).length)}
+                    ${field("Detected project matches", servers.some((server) => server.matched === null || server.matched === undefined)
+                        ? "Not checked for all servers" : servers.filter((server) => server.matched).length)}
+                    ${button("Refresh LSP", () => prepare("lsp", "refresh"))}</div>
+                <div style=${CARD_STYLE}><strong>AST</strong>${field("Installed / detected", cachedAvailability(ast))}${field("Version", ast?.version)}
+                    ${ast?.error ? html`<div class="error-box">${displayValue(ast.error)}</div>` : ""}</div>
+                <div style=${CARD_STYLE}><strong>CodeGraph</strong>${field("Installed / detected", cachedAvailability(graph))}
+                    ${field("Index exists", indexExists)}${field("Build state", graph?.buildState)}
+                    ${field("Engine compatibility", graph?.engineCompatibility)}${field("Source freshness", graph?.sourceFreshness)}
+                    ${graph?.error ? html`<div class="error-box">${displayValue(graph.error)}</div>` : ""}</div>
+                <h3>Proposals</h3>
+                ${(snapshot.proposals || []).length ? (snapshot.proposals || []).slice(0, 30).map((proposal) => html`<div style=${CARD_STYLE}>
+                    <strong>${shortStr(proposal.title) || "Edit proposal"}</strong>${field("Proposal", proposal.id)}
+                    ${field("Files", proposal.files)}${field("Command consent required", proposal.requiresConsent)}
+                    ${button(proposal.requiresConsent ? "Review command consent" : "Review apply", () => prepare("lsp", "apply", { proposalId: proposal.id }))}
+                </div>`) : html`<p class="muted">No pending proposals in this workspace.</p>`}
+                ${(snapshot.proposals || []).length > 30 ? html`<p class="muted">Showing the first 30 proposals.</p>` : ""}
+            </div>` : ""}
+            ${snapshot && tab === "LSP" ? html`<div role="tabpanel" aria-label="LSP" style="margin-top: 0.8rem;">
+                <div style=${ROW_STYLE}>${["detected", "running", "all"].map((value) => html`<button class="button"
+                    aria-pressed=${filter === value} onClick=${() => setFilter(value)}>${value === "all" ? "All" : value === "running" ? "Running" : "Detected"}</button>`)}
+                    ${button("Refresh", () => prepare("lsp", "refresh"))}</div>
+                ${filtered.length ? filtered.map((server) => html`<div style=${CARD_STYLE}>
+                    <div style=${ROW_STYLE}><span style="width: 8px; height: 8px; border-radius: 50%; background: ${server.running
+                        ? "var(--success, #22c55e)" : serverAvailability(server) === true ? "var(--accent, #3b82f6)" : "var(--text-dim, #555)"};"></span>
+                        <strong>${server.id}</strong>${server.isLinter ? html`<span class="muted">linter</span>` : ""}</div>
+                    ${field("Command", server.command)}${field("Types", server.fileTypes)}
+                    ${field("Installed / detected", serverAvailability(server) === null ? "Not checked" : serverAvailability(server))}
+                    ${field("Project match", server.matched === null || server.matched === undefined ? "Not checked" : server.matched)}${field("Running", server.running)}
+                    ${field("Checked at", displayTime(server.checkedAt))}
+                    ${field("Version", server.version)}${field("Provenance", server.provenance)}
+                    ${field("Advertised capabilities", server.capabilities)}${field("Trust policy", server.trustPolicy)}
+                    ${server.error || server.lastError ? html`<div class="error-box" role="alert">${displayValue(server.error || server.lastError)}</div>` : ""}
+                    <div style=${ROW_STYLE}>
+                        ${server.running ? button("Stop", () => runLifecycle("stop", server.id))
+                            : serverAvailability(server) === true ? button("Start", () => runLifecycle("start", server.id))
+                            : serverAvailability(server) === null ? html`<span class="muted">Not checked · use Refresh</span>`
+                            : server.installCmd ? button("Install", () => prepare("lsp", "install", { serverId: server.id }))
+                            : html`<span class="muted">Not installed</span>`}
+                        ${serverAvailability(server) === true && server.uninstallCmd && !server.running
+                            ? button("Uninstall", () => prepare("lsp", "uninstall", { serverId: server.id })) : ""}
+                    </div>
+                </div>`) : html`<p class="muted">${filter === "running" ? "No language servers running for this workspace."
+                    : filter === "detected" ? `No project matches. Click All to browse ${servers.length} supported servers.` : "No language servers returned."}</p>`}
+            </div>` : ""}
+            ${snapshot && tab === "AST" ? html`<div role="tabpanel" aria-label="AST" style="margin-top: 0.8rem;">
+                ${providerCard("ast", ast)}${field("Configuration policy", ast?.configPolicy ?? ast?.configuration)}
+                ${field("Parser policy", ast?.parserPolicy)}
+            </div>` : ""}
+            ${snapshot && tab === "CodeGraph" ? html`<div role="tabpanel" aria-label="CodeGraph" style="margin-top: 0.8rem;">
+                ${providerCard("graph", graph)}<div style=${CARD_STYLE}>
+                    ${field("Project / index root", graph?.indexRoot)}${field("Index path", graph?.indexPath)}
+                    ${field("Index exists", indexExists)}${field("Build state", graph?.buildState)}
+                    ${field("Build version", graph?.buildVersion)}${field("Extraction version", graph?.extractionVersion)}
+                    ${field("Built at", displayTime(graph?.builtAt))}${field("Index generation", graph?.generation)}
+                    ${field("Engine compatibility", graph?.engineCompatibility)}${field("Source freshness", graph?.sourceFreshness)}
+                    ${field("Freshness checked at", displayTime(graph?.sourceCheckedAt))}
+                    ${field("Last operation", graph?.lastOperation)}
+                    <p class="muted">Installation is not an index. Engine compatibility is distinct from source freshness; an unchecked timestamp does not prove current sources.</p>
+                    <div style=${ROW_STYLE}>
+                        ${button("Create index", () => prepare("graph", "create"), !graph?.available || graph?.compatible === false || graph?.initialized !== false)}
+                        ${button("Sync index", () => prepare("graph", "sync"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
+                        ${button("Rebuild index", () => prepare("graph", "rebuild"), !graph?.available || graph?.compatible === false || graph?.initialized !== true)}
+                    </div>
+                </div>
+            </div>` : ""}
+        </div>`;
     }
 
-    // Register slide-in sheet
-    if (typeof pocket.sheet === "function") {
-        pocket.sheet({
-            id: "lsp",
-            title: "Language Servers",
-            component: LspSheet,
-        });
-    }
-
-    // Register top / hamburger menu
-    if (typeof pocket.menu === "function") {
-        pocket.menu({
-            id: "lsp",
-            label: "Language Servers",
-            hint: "Manage active and detected language servers",
-            sheet: "lsp",
-        });
-    }
-
-    // Register launcher entry (Cmd/Ctrl + K)
-    if (typeof pocket.launcher === "function") {
-        pocket.launcher({
-            id: "lsp",
-            label: "Language Servers",
-            detail: "Diagnostics, LSP tools, and installed servers",
-            iconPath: CODE_ICON_PATH,
-            keywords: ["lsp", "code", "diagnostics", "definition", "server"],
-            sheet: "lsp",
-        });
-    }
-    // Register tool call display in transcripts and peek tiles
+    registrations.push(pocket.sheet({ id: "lsp", title: "Tooling", component: ToolingSheet, wide: true }));
+    registrations.push(pocket.menu({ id: "lsp", label: "Tooling", hint: "LSP · AST · CodeGraph", sheet: "lsp" }));
+    registrations.push(pocket.launcher({
+        id: "lsp", label: "Tooling", detail: "Language servers, structural AST, and indexed CodeGraph",
+        iconPath: CODE_ICON_PATH, keywords: ["lsp", "ast", "codegraph", "code", "diagnostics", "definition", "server"], sheet: "lsp",
+    }));
+    // Preserve the original four call presentations and add provider-specific summaries.
     const toolCallHandles = [
         pocket.toolCall({
             tool: "lsp_status",
@@ -337,12 +498,40 @@ export default function setup(pocket) {
                 return { verb: "managed servers" };
             },
         }),
+        pocket.toolCall({
+            tool: "lsp_query", iconPath: CODE_ICON_PATH,
+            label: (args) => typeof QUERY_LABELS[safeStr(args?.action)] === "string"
+                ? QUERY_LABELS[safeStr(args?.action)] : "query language server",
+            subject: (args) => shortStr(args?.file) || shortStr(args?.query) || "current workspace",
+            summary: () => ({ verb: "queried semantic tooling" }),
+        }),
+        pocket.toolCall({
+            tool: "fana_ast", iconPath: CODE_ICON_PATH,
+            label: (args) => typeof AST_LABELS[safeStr(args?.action)] === "string"
+                ? AST_LABELS[safeStr(args?.action)] : "query structural tooling",
+            subject: (args) => Array.isArray(args?.paths)
+                ? args.paths.slice(0, 3).map(shortStr).filter(Boolean).join(" · ") || "current workspace"
+                : shortStr(args?.file) || "current workspace",
+            summary: () => ({ verb: "queried structural tooling" }),
+        }),
+        pocket.toolCall({
+            tool: "fana_graph", iconPath: CODE_ICON_PATH,
+            label: (args) => typeof GRAPH_LABELS[safeStr(args?.action)] === "string"
+                ? GRAPH_LABELS[safeStr(args?.action)] : "query indexed code",
+            subject: (args) => shortStr(args?.symbol) || shortStr(args?.query) || shortStr(args?.file) || "current workspace",
+            summary: () => ({ verb: "queried indexed evidence" }),
+        }),
+        pocket.toolCall({
+            tool: "fana_apply", iconPath: CODE_ICON_PATH,
+            label: () => "apply proposed operation",
+            subject: (args) => shortStr(args?.proposalId) || "edit proposal",
+            summary: () => ({ verb: "requested proposal application" }),
+        }),
     ];
 
-    // Register header status badge
+    // The badge also reads only cached metadata, never a provider status subprocess.
     let statusItem = null;
     let statusRequest = null;
-    let disposed = false;
     let lastCwd = "";
     const clearStatus = () => {
         statusItem?.remove();
@@ -351,52 +540,76 @@ export default function setup(pocket) {
     const updateStatus = async () => {
         if (disposed) return;
         statusRequest?.abort();
-        const stop = new AbortController();
+        const stop = newController();
         statusRequest = stop;
         const cid = pocket.conversationId();
         try {
-            const data = await pocket.api(serverPath(cid), undefined, { signal: stop.signal });
+            const data = await pocket.api(toolingPath(cid), undefined, { signal: stop.signal });
             if (stop.signal.aborted || disposed || pocket.conversationId() !== cid) return;
+            if (!data || typeof data.cwd !== "string" || !Array.isArray(data.servers)) {
+                throw new Error("Invalid cached Tooling status response.");
+            }
             lastCwd = data.cwd;
-            const runningCount = data.servers.filter((s) => s.running).length;
-            if (runningCount > 0) {
-                const item = {
-                    id: "lsp",
-                    title: "Language Server Protocol",
-                    text: `${runningCount} LSP active`,
-                    short: `${runningCount} LSP`,
-                    sheet: "lsp",
-                };
-                if (statusItem) statusItem.update(item);
-                else statusItem = pocket.status(item);
-            } else clearStatus();
+            const runningCount = data.servers.filter((server) => server.running).length;
+            const astState = cachedAvailability(data.ast) === "Not checked" ? "not checked"
+                : data.ast?.available === true ? data.ast.compatible === false ? "incompatible" : data.ast.compatible === true ? "ready" : "detected"
+                : data.ast?.available === false ? "missing" : "unknown";
+            const graphState = cachedAvailability(data.graph) === "Not checked" ? "not checked"
+                : data.graph?.available === false ? "missing"
+                : data.graph?.compatible === false ? "incompatible"
+                : data.graph?.initialized === false ? "no index"
+                : data.graph?.initialized === true ? shortStr(data.graph.buildState) || "index present" : "unknown";
+            const item = {
+                id: "lsp", label: "Tooling", title: `Tooling · ${shortStr(data.cwd)} · cached provider status`,
+                text: `${runningCount} LSP active · AST ${astState} · Graph ${graphState}`,
+                short: `${runningCount} LSP · AST ${astState} · Graph ${graphState}`, sheet: "lsp",
+                tone: data.ast?.error || data.graph?.error ? "error"
+                    : data.graph?.engineCompatibility === "incompatible" || data.graph?.sourceFreshness === "known_changed" ? "warn" : undefined,
+            };
+            if (statusItem) statusItem.update(item);
+            else statusItem = pocket.status(item);
         } catch {
-            // An unreadable status must not leave a stale active badge.
+            // An unreadable status must not leave stale provider claims in the badge.
             if (!stop.signal.aborted && !disposed && pocket.conversationId() === cid) clearStatus();
+        } finally {
+            controllers.delete(stop);
+            if (statusRequest === stop) statusRequest = null;
         }
     };
 
-    const stopConversation = pocket.onConversation(() => {
+    ownCleanup(pocket.onConversation(() => {
+        abortRequests();
         lastCwd = "";
         clearStatus();
         updateStatus();
-    });
+    }));
     const statusInterval = setInterval(updateStatus, 15000);
-
-    const stopLspChanged = pocket.on("lsp-changed", (evt) => {
+    ownCleanup(() => clearInterval(statusInterval));
+    const changed = (evt) => {
         if (disposed) return;
-        const eventCwd = evt && typeof evt === "object" && typeof evt.cwd === "string" ? evt.cwd : "";
+        const eventCwd = safeStr(evt?.cwd);
         if (eventCwd && lastCwd && eventCwd !== lastCwd) return;
         updateStatus();
+    };
+    ownCleanup(pocket.on("lsp-changed", changed));
+    window.addEventListener("pagehide", abortRequests);
+    window.addEventListener("popstate", abortRequests);
+    window.addEventListener("offline", abortRequests);
+    window.addEventListener("online", updateStatus);
+    window.addEventListener("pageshow", updateStatus);
+    ownCleanup(() => {
+        window.removeEventListener("pagehide", abortRequests);
+        window.removeEventListener("popstate", abortRequests);
+        window.removeEventListener("offline", abortRequests);
+        window.removeEventListener("online", updateStatus);
+        window.removeEventListener("pageshow", updateStatus);
     });
-
     pocket.onDispose(() => {
         disposed = true;
-        statusRequest?.abort();
-        clearInterval(statusInterval);
-        stopConversation();
-        stopLspChanged();
+        abortRequests();
+        for (const cleanup of [...cleanups]) cleanup();
         for (const handle of toolCallHandles) handle.remove();
+        for (const handle of registrations) handle.remove();
         clearStatus();
     });
 }

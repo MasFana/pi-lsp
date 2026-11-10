@@ -4,7 +4,7 @@ import type { Host } from "../pi-pocket/types/pocket.d.ts";
 import type * as LspModule from "./pi-lsp.ts";
 import type { Extension, ToolHooks } from "../pi-pocket/node_modules/@earendil-works/pi-durable/dist/index.d.ts";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getEventListeners, once } from "node:events";
@@ -37,6 +37,7 @@ before(async () => {
     writeFileSync(join(workspace, "package.json"), "{}");
     writeFileSync(join(dropIn, "pi-lsp.ts"), readFileSync(new URL("./pi-lsp.ts", import.meta.url)));
     writeFileSync(join(dropIn, "pi-lsp.js"), readFileSync(new URL("./pi-lsp.js", import.meta.url)));
+    cpSync(new URL("./pi-lsp/", import.meta.url), join(dropIn, "pi-lsp"), { recursive: true });
     writeFileSync(fixture, `
 import { appendFileSync } from 'node:fs';
 const mode=process.argv[2], log=process.argv[3];

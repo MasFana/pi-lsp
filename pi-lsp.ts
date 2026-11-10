@@ -2,20 +2,20 @@
  * pi-lsp: Full Language Server Protocol integration for Pi Pocket.
  * Supports auto-detection, execution, tool integration, and web-based installation/management.
  */
-import { exec, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 import { Type } from "typebox";
 import { defineExtension, defineTool, hook, section, ToolTask } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId, ToolExecutionApi } from "@earendil-works/pi-durable";
 import type { Host as PocketHost, Web as ExtensionWeb, WebRequest, ConversationWebRequest } from "./_pocket.d.ts";
+import { createTooling } from "./pi-lsp/v1.3.0/tooling.ts";
+import { canonicalFile } from "./pi-lsp/v1.3.0/proposals.ts";
 
 export const pocketApi = 2;
 
-const execAsync = promisify(exec);
 
 
 export interface ServerConfig {
@@ -477,7 +477,7 @@ async function getSessionCwd(api: ToolExecutionApi, context: Context): Promise<s
     const cwd = api.env?.cwd ?? (await api.agent(context)).cwd;
     if (!cwd) throw new Error("No session workspace found");
     if (workspaceScheme(cwd)) throw new Error(`Remote workspaces are not supported: ${cwd}`);
-    return resolve(cwd);
+    return realpathSync(resolve(cwd));
 }
 
 function isExecutableFile(candidate: string): boolean {
@@ -605,6 +605,7 @@ export interface ActiveClient {
     diagnosticMeta: Map<string, { version?: number; stale: boolean }>;
     diagnosticWaiters: Map<string, Set<DiagnosticWaiter>>;
     serverCapabilities?: Record<string, unknown>;
+    applyEditHandler?: (edit: unknown) => Promise<{ applied: boolean; failureReason?: string }>;
     buffer: Buffer;
     openFiles: Map<string, { version: number; text: string }>;
     running: boolean;
@@ -613,6 +614,7 @@ export interface ActiveClient {
 
 export const clients = new Map<string, ActiveClient>();
 const starting = new Map<string, Promise<ActiveClient>>();
+const serverStatusCache = new Map<string, Record<string, unknown>[]>();
 let notifyChange: ((cwd: string) => void) | undefined;
 const INCOMPLETE_TOOL_RESULTS: Record<string, true> = {
     blocked: true, invalid_arguments: true, aborted: true,
@@ -744,6 +746,12 @@ function handleLspData(client: ActiveClient, chunk: Buffer) {
                     sendLspResponse(client, parsed.id, [
                         { uri: pathToFileURL(client.workspaceRoot).href, name: basename(client.workspaceRoot) },
                     ]);
+                } else if (parsed.method === "workspace/applyEdit") {
+                    const requestId = parsed.id;
+                    if (!client.applyEditHandler) sendLspResponse(client, requestId, { applied: false, failureReason: "No owner-authorized command is active" });
+                    else Promise.resolve(client.applyEditHandler(parsed.params?.edit))
+                        .then((result) => sendLspResponse(client, requestId, result))
+                        .catch((error) => sendLspResponse(client, requestId, { applied: false, failureReason: error instanceof Error ? error.message : "Edit rejected" }));
                 } else {
                     sendLspResponse(client, parsed.id, undefined, { code: -32601, message: `Unsupported method: ${parsed.method}` });
                 }
@@ -779,7 +787,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
     if (workspaceScheme(cwd)) {
         throw new Error(`Remote workspaces are not supported: ${cwd}`);
     }
-    const resolvedCwd = resolve(cwd);
+    const resolvedCwd = realpathSync(resolve(cwd));
     const key = `${id}:${resolvedCwd}`;
 
     const existing = clients.get(key);
@@ -882,6 +890,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                         { uri: pathToFileURL(resolvedCwd).href, name: basename(resolvedCwd) },
                     ],
                     capabilities: {
+                        general: { positionEncodings: ["utf-16"] },
                         textDocument: {
                             synchronization: {
                                 dynamicRegistration: false,
@@ -892,10 +901,21 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
                             definition: { dynamicRegistration: false, linkSupport: true },
                             publishDiagnostics: { relatedInformation: true, versionSupport: true },
                             diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
+                            references: { dynamicRegistration: false },
+                            hover: { dynamicRegistration: false, contentFormat: ["plaintext", "markdown"] },
+                            documentSymbol: { dynamicRegistration: false, hierarchicalDocumentSymbolSupport: true },
+                            implementation: { dynamicRegistration: false, linkSupport: true },
+                            rename: { dynamicRegistration: false, prepareSupport: true },
+                            formatting: { dynamicRegistration: false },
+                            codeAction: { dynamicRegistration: false, codeActionLiteralSupport: { codeActionKind: { valueSet: ["", "quickfix", "refactor", "source"] } }, dataSupport: true, disabledSupport: true, isPreferredSupport: true, resolveSupport: { properties: ["edit", "command"] } },
                         },
                         workspace: {
                             configuration: true,
                             workspaceFolders: true,
+                            applyEdit: true,
+                            workspaceEdit: { documentChanges: true, resourceOperations: [], failureHandling: "abort" },
+                            symbol: { dynamicRegistration: false },
+                            executeCommand: { dynamicRegistration: false },
                         },
                     },
                     initializationOptions: config.initOptions || {},
@@ -910,6 +930,7 @@ export async function startServer(id: string, config: ServerConfig, cwd: string)
             }
 
             client.serverCapabilities = initialized.capabilities as Record<string, unknown>;
+            if (client.serverCapabilities.positionEncoding !== undefined && client.serverCapabilities.positionEncoding !== "utf-16") throw new Error("Server selected an unadvertised position encoding; UTF-16 is required");
             client.running = true;
             proc.removeListener("error", onEarlyError);
             proc.removeListener("exit", onEarlyExit);
@@ -1037,8 +1058,8 @@ export async function getServersForCwd(cwd: string) {
     if (workspaceScheme(cwd)) {
         throw new Error(`Remote workspaces are not supported: ${cwd}`);
     }
-    const resolvedCwd = resolve(cwd);
-    return Promise.all(
+    const resolvedCwd = realpathSync(resolve(cwd));
+    const list = await Promise.all(
         Object.entries(LSP_SERVERS).map(async ([id, conf]) => {
             const available = findExecutable(conf.command, resolvedCwd) !== undefined;
             const matched = matchesMarkersOrExtensions(conf, resolvedCwd);
@@ -1065,11 +1086,14 @@ export async function getServersForCwd(cwd: string) {
                 uninstallCmd: conf.uninstallCmd,
                 available,
                 matched,
+                checkedAt: Date.now(),
                 running: isRunning,
                 instances,
             };
         }),
     );
+    serverStatusCache.set(resolvedCwd, list);
+    return list;
 }
 
 function detectLanguageId(filePath: string): string {
@@ -1231,8 +1255,9 @@ function diagnosticSummary(diagnostics: unknown[]): string {
     }).join("\n") + (diagnostics.length > 10 ? `\n...and ${diagnostics.length - 10} more` : "");
 }
 
-async function diagnoseFile(host: PocketHost, conversationId: ConversationId, cwd: string, file: string, context: Context) {
-    assertOwner(host, conversationId, "synchronize files with language servers");
+async function diagnoseFile(host: PocketHost, conversationId: ConversationId | undefined, cwd: string, file: string, context: Context, authority = () => assertOwner(host, conversationId, "synchronize files with language servers"), allowIncomplete = false) {
+    authority();
+    cwd = realpathSync(resolve(cwd));
     context.abortSignal?.throwIfAborted();
     if (!statSync(file).isFile()) throw new Error("Diagnostic target is not a source file");
     const ext = extname(file).toLowerCase();
@@ -1243,11 +1268,11 @@ async function diagnoseFile(host: PocketHost, conversationId: ConversationId, cw
         if (!candidate) throw new Error(`No installed language server matches ${ext || "this filename"}; file not checked`);
         matching = [await startServer(candidate.id, candidate.conf, cwd)];
     }
-    assertOwner(host, conversationId, "synchronize files with language servers");
+    authority();
     context.abortSignal?.throwIfAborted();
     const synced = matching.map((client) => ({ client, ...syncFileToClient(client, file) }));
     const reports = await Promise.allSettled(synced.map(({ client, uri, version }) => waitForFreshDiagnostics(client, uri, version, context)));
-    assertOwner(host, conversationId, "read file diagnostics");
+    authority();
     context.abortSignal?.throwIfAborted();
     const diagnostics: unknown[] = [];
     const failures: string[] = [];
@@ -1255,9 +1280,9 @@ async function diagnoseFile(host: PocketHost, conversationId: ConversationId, cw
         if (report.status === "fulfilled") diagnostics.push(...report.value);
         else failures.push(`${matching[index].id}: ${report.reason instanceof Error ? report.reason.message : "diagnostic request failed"}`);
     });
-    if (failures.length) throw new Error(`Incomplete LSP check; file not verified. ${failures.join("; ")}${diagnostics.length ? `\n${diagnosticSummary(diagnostics)}` : ""}`);
+    if (failures.length && !allowIncomplete) throw new Error(`Incomplete LSP check; file not verified. ${failures.join("; ")}${diagnostics.length ? `\n${diagnosticSummary(diagnostics)}` : ""}`);
     notifyChange?.(cwd);
-    return { uri: pathToFileURL(file).href, diagnostics };
+    return { uri: pathToFileURL(file).href, diagnostics, incomplete: failures.length > 0 };
 }
 
 export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
@@ -1265,6 +1290,39 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         try { web?.send("lsp-changed", { cwd }); }
         catch (error) { console.warn("LSP dashboard update failed", error); }
     };
+    const tooling = createTooling(host, web, {
+        findExecutable,
+        request: (client, method, params, signal) => sendLsp(client, method, params, 10_000, signal),
+        sync: syncFileToClient,
+        async select(cwd, file, server, capability) {
+            let id = server;
+            if (id && !Object.hasOwn(LSP_SERVERS, id)) throw new Error(`Unknown server ${id}`);
+            if (!id && file) id = findBestServerForExt(extname(file).toLowerCase(), cwd)?.id;
+            if (!id) id = [...clients.values()].find((client) => client.running && client.workspaceRoot === cwd && client.serverCapabilities?.[capability])?.id;
+            if (!id) throw new Error("No eligible server; specify an installed server for a workspace query");
+            const conf = LSP_SERVERS[id]!;
+            if (conf.disabled) throw new Error("This server is disabled");
+            const client = await startServer(id, conf, cwd);
+            if (!client.serverCapabilities?.[capability]) throw new Error(`${id} does not support ${capability}`);
+            return client;
+        },
+        diagnose: (cwd, file, context, authority) => diagnoseFile(host, undefined, cwd, file, context, authority, true),
+        async servers(cwd) {
+            const cached = serverStatusCache.get(cwd);
+            return (cached ?? Object.entries(LSP_SERVERS).map(([id, conf]) => ({ id, ...conf, available: null, matched: null }))).map((row) => {
+                const client = clients.get(`${row.id}:${cwd}`);
+                return { ...row, running: client?.running === true, capabilities: client?.serverCapabilities ?? {}, instances: client?.running ? [{ cwd, diagnosticsCount: [...client.diagnostics.values()].reduce((sum, values) => sum + values.length, 0) }] : [] };
+            });
+        },
+        refreshServers: getServersForCwd,
+        config: (server) => Object.hasOwn(LSP_SERVERS, server) ? LSP_SERVERS[server] : undefined,
+        version: (cwd, file, server) => {
+            const uri = pathToFileURL(file).href;
+            if (server) return clients.get(`${server}:${cwd}`)?.openFiles.get(uri)?.version;
+            for (const client of clients.values()) if (client.running && client.workspaceRoot === cwd && client.openFiles.has(uri)) return client.openFiles.get(uri)?.version;
+            return undefined;
+        },
+    });
 
     if (web) {
         web.settings([{
@@ -1324,7 +1382,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
                 const body = getRequestBody(req);
                 const serverId = typeof body.serverId === "string" ? body.serverId : "";
-                const key = `${serverId}:${resolve(cwd)}`;
+                const key = `${serverId}:${realpathSync(resolve(cwd))}`;
                 await stopClient(key);
                 return { ok: true };
             },
@@ -1339,7 +1397,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 const serverId = typeof body.serverId === "string" ? body.serverId : "";
                 const cwd = typeof body.cwd === "string" ? body.cwd : process.cwd();
                 if (workspaceScheme(cwd)) throw web.error(400, "Remote workspaces are not supported");
-                const key = `${serverId}:${resolve(cwd)}`;
+                const key = `${serverId}:${realpathSync(resolve(cwd))}`;
                 await stopClient(key);
                 return { ok: true };
             },
@@ -1371,7 +1429,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.installCmd) throw web.error(400, "No install command available");
                 try {
-                    const { stdout, stderr } = await execAsync(conf.installCmd);
+                    const { stdout, stderr } = await tooling.runCommand(conf.installCmd, process.cwd(), req.signal, () => { if (host.roleOf(req.user.id) !== "owner") throw new Error("Owner permission required"); });
                     return { ok: true, output: stdout || stderr };
                 } catch (err: unknown) {
                     throw web.error(500, err instanceof Error ? err.message : String(err));
@@ -1389,7 +1447,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 const conf = LSP_SERVERS[serverId];
                 if (!conf?.uninstallCmd) throw web.error(400, "No uninstall command available");
                 try {
-                    const { stdout, stderr } = await execAsync(conf.uninstallCmd);
+                    const { stdout, stderr } = await tooling.runCommand(conf.uninstallCmd, process.cwd(), req.signal, () => { if (host.roleOf(req.user.id) !== "owner") throw new Error("Owner permission required"); });
                     return { ok: true, output: stdout || stderr };
                 } catch (err: unknown) {
                     throw web.error(500, err instanceof Error ? err.message : String(err));
@@ -1400,7 +1458,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         web.onDispose(async () => {
             const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<void>();
             const timer = setTimeout(resolveTimeout, 3000);
-            await Promise.race([stopAllClients(), timeoutPromise]);
+            await Promise.race([Promise.allSettled([stopAllClients(), tooling.dispose()]), timeoutPromise]);
             clearTimeout(timer);
         });
     }
@@ -1476,7 +1534,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
         name: "lsp_definition",
         description: "Jump to definition of symbol at file, line, and column.",
         parameters: Type.Object({
-            server: Type.String({ description: "Language server id (e.g. rust-analyzer, gopls, pyright)" }),
+            server: Type.Optional(Type.String({ description: "Language server id; selected from the file when omitted" })),
             file: Type.String({ description: "Path to file" }),
             line: Type.Number({ description: "0-based line number" }),
             character: Type.Number({ description: "0-based character offset" }),
@@ -1486,16 +1544,18 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             const resolvedCwd = await getSessionCwd(api, context);
             assertOwner(host, api.conversationId, "jump to definition");
             context.abortSignal?.throwIfAborted();
-            let client = clients.get(`${args.server}:${resolvedCwd}`);
+            const absPath = await canonicalFile(resolvedCwd, args.file);
+            const serverId = args.server ?? findBestServerForExt(extname(absPath).toLowerCase(), resolvedCwd)?.id;
+            if (!serverId) throw new Error("No installed language server matches this file");
+            let client = clients.get(`${serverId}:${resolvedCwd}`);
             if (!client || !client.running) {
-                const conf = Object.hasOwn(LSP_SERVERS, args.server) ? LSP_SERVERS[args.server] : undefined;
-                if (!conf) throw new Error(`Unknown server ${args.server}`);
-                client = await startServer(args.server, conf, resolvedCwd);
+                const conf = Object.hasOwn(LSP_SERVERS, serverId) ? LSP_SERVERS[serverId] : undefined;
+                if (!conf) throw new Error(`Unknown server ${serverId}`);
+                client = await startServer(serverId, conf, resolvedCwd);
                 assertOwner(host, api.conversationId, "jump to definition");
                 context.abortSignal?.throwIfAborted();
             }
 
-            const absPath = args.file.startsWith("/") ? resolve(args.file) : resolve(resolvedCwd, args.file);
             const { uri } = syncFileToClient(client, absPath);
 
             const res = await sendLsp(client, "textDocument/definition", {
@@ -1544,7 +1604,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                 case "uninstall": {
                     const command = args.action === "install" ? conf.installCmd : conf.uninstallCmd;
                     if (!command) throw new Error(`No ${args.action} command for ${args.server}`);
-                    const { stdout, stderr } = await execAsync(command);
+                    const { stdout, stderr } = await tooling.runCommand(command, resolvedCwd, context.abortSignal, () => assertOwner(host, api.conversationId, "manage language servers"));
                     return { output: [{ type: "text" as const, text: `${args.action === "install" ? "Installed" : "Uninstalled"}:\n${stdout || stderr}` }] };
                 }
                 default:
@@ -1560,8 +1620,10 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
             Object.assign(lspDiagnosticsTool, { annotations: { readOnlyHint: true } }),
             lspDefinitionTool,
             lspManageTool,
+            ...tooling.tools,
         ],
         sections: [
+            ...tooling.sections,
             section("lsp_workflow", (input, _context) => {
                 const hasTool = input.agent.tools.some((t) => t.name.startsWith("lsp_")) ||
                     input.agent.callable.some((t) => t.name.startsWith("lsp_") && t.callers?.includes("model") === false);
@@ -1607,6 +1669,7 @@ export default function createPiLsp(host: PocketHost, web?: ExtensionWeb) {
                     if (workspaceScheme(cwd)) return undefined;
                     const resolvedCwd = resolve(cwd);
                     const absolute = resolve(resolvedCwd, file);
+                    tooling.changed(resolvedCwd, [absolute]);
                     if (basename(absolute).startsWith(".env")) return undefined;
                     const ext = extname(absolute).toLowerCase();
                     if (!Object.values(LSP_SERVERS).some((config) => config.fileTypes.some((fileType) => fileType.toLowerCase() === ext))) return undefined;
