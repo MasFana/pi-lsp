@@ -48,7 +48,7 @@ const displayValue = (value, depth = 0) => {
     return "Unknown";
 };
 const operationOutcome = (result) => {
-    const details = [result?.message ?? `${result?.action ?? "Operation"}: ${result?.status ?? "unknown"}`];
+    const details = [`${String(result?.status ?? "unknown").toUpperCase()} · ${result?.message ?? result?.action ?? "Operation"}`];
     if (result?.executable) details.push(`Executable: ${result.executable}`);
     if (result?.version) details.push(`Version: ${result.version}`);
     if (result?.installer) details.push(`Installer exit: ${result.installer.exitCode ?? "unknown"}${result.installer.stderr ? ` · ${result.installer.stderr}` : ""}`);
@@ -243,7 +243,6 @@ export default function setup(pocket) {
                     { provider, action, ...extra }, { signal: stop.signal });
                 if (!current(stop)) return;
                 if (action !== "refresh" || result?.status === "failed" || result?.status === "partial") setOutcome(operationOutcome(result));
-                if (result?.status === "failed" || result?.status === "partial") setActionError(result?.error ?? result?.message ?? "Operation did not complete");
                 setRefresh((value) => value + 1);
                 updateStatus();
             } catch (failure) { failOperation(stop, failure); }
@@ -299,7 +298,7 @@ export default function setup(pocket) {
 
         return html`<div style="padding: 1rem; font-size: 0.85rem; height: 100%; overflow-y: auto;">
             <div style="overflow-wrap: anywhere;"><strong>Tooling</strong>${field("Workspace", cwd || (loading ? "Loading" : "Unknown"))}</div>
-            <p class="muted">Cached status only · polls every 15 seconds. Refresh is an explicit owner operation.</p>
+            <p class="muted">Provider detection is automatic · panel updates every 15 seconds. Existing CodeGraph indexes sync on source changes.</p>
             <div role="tablist" aria-label="Tooling providers" style=${ROW_STYLE}>
                 ${["Overview", "LSP", "AST", "CodeGraph"].map((name) => html`<button class="button" role="tab"
                     aria-selected=${tab === name} onClick=${() => setTab(name)}>${name}</button>`)}
