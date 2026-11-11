@@ -272,14 +272,6 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         installCmd: "npm install -g @olrtg/emmet-language-server",
         uninstallCmd: "npm uninstall -g @olrtg/emmet-language-server",
     },
-    intelephense: {
-        command: "intelephense",
-        args: ["--stdio"],
-        fileTypes: [".php",".phtml"],
-        rootMarkers: ["composer.json",".git","composer.lock"],
-        installCmd: "npm install -g intelephense",
-        uninstallCmd: "npm uninstall -g intelephense",
-    },
     phpactor: {
         command: "phpactor",
         args: ["language-server"],
@@ -287,6 +279,14 @@ export const LSP_SERVERS: Record<string, ServerConfig> = {
         rootMarkers: ["composer.json",".git",".phpactor.json",".phpactor.yml"],
         installCmd: "composer global require phpactor/phpactor",
         uninstallCmd: "composer global remove phpactor/phpactor",
+    },
+    intelephense: {
+        command: "intelephense",
+        args: ["--stdio"],
+        fileTypes: [".php",".phtml"],
+        rootMarkers: ["composer.json",".git","composer.lock"],
+        installCmd: "npm install -g intelephense",
+        uninstallCmd: "npm uninstall -g intelephense",
     },
     solargraph: {
         command: "solargraph",
@@ -640,6 +640,8 @@ export interface DiagnosticWaiter {
     resolve: (diags: unknown[]) => void;
     reject: (err: Error) => void;
     timer: NodeJS.Timeout;
+    // Set once an empty first publish was held back, so only one grace window runs per file.
+    emptyDeferred?: boolean;
 }
 
 export interface ActiveClient {
@@ -685,7 +687,7 @@ function cancellationError(signal: AbortSignal): Error {
     return signal.reason instanceof Error ? signal.reason : new Error("LSP request canceled");
 }
 
-function sendLsp(client: ActiveClient, method: string, params: unknown, timeoutMs = 10000, signal?: AbortSignal): Promise<unknown> {
+function sendLsp(client: ActiveClient, method: string, params: unknown, timeoutMs = 30000, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) return Promise.reject(cancellationError(signal));
     if (!client.running && method !== "initialize" && method !== "shutdown") {
         return Promise.reject(new Error(`LSP server ${client.id} is not running`));
@@ -800,6 +802,8 @@ function handleLspData(client: ActiveClient, chunk: Buffer) {
                     else Promise.resolve(client.applyEditHandler(parsed.params?.edit))
                         .then((result) => sendLspResponse(client, requestId, result))
                         .catch((error) => sendLspResponse(client, requestId, { applied: false, failureReason: error instanceof Error ? error.message : "Edit rejected" }));
+                } else if (parsed.method === "client/registerCapability" || parsed.method === "client/unregisterCapability" || parsed.method === "window/workDoneProgress/create") {
+                    sendLspResponse(client, parsed.id, null);
                 } else {
                     sendLspResponse(client, parsed.id, undefined, { code: -32601, message: `Unsupported method: ${parsed.method}` });
                 }
@@ -814,13 +818,23 @@ function handleLspData(client: ActiveClient, chunk: Buffer) {
                     if (fileInfo && version !== undefined && version !== fileInfo.version) {
                         // A report for another document version cannot validate the current text.
                     } else {
+                        const hadPublish = client.diagnostics.has(uri);
                         client.diagnostics.set(uri, diags);
                         client.diagnosticMeta.set(uri, { version, stale: false });
 
                         const waiters = client.diagnosticWaiters.get(uri);
                         if (waiters && waiters.size > 0) {
                             for (const waiter of waiters) {
-                                if (version === undefined || version >= waiter.minVersion) waiter.resolve(diags);
+                                if (version !== undefined && version < waiter.minVersion) continue;
+                                // A first empty publish precedes semantic analysis (tsserver sends one on open);
+                                // hold that waiter once for a later, fuller report.
+                                if (diags.length === 0 && !hadPublish && !waiter.emptyDeferred) {
+                                    waiter.emptyDeferred = true;
+                                    clearTimeout(waiter.timer);
+                                    waiter.timer = setTimeout(() => waiter.resolve([]), 5000);
+                                } else {
+                                    waiter.resolve(diags);
+                                }
                             }
                         }
 
@@ -1214,7 +1228,7 @@ export async function waitForFreshDiagnostics(
     uri: string,
     targetVersion: number,
     context?: Context,
-    timeoutMs = 5000,
+    timeoutMs = 60000,
 ): Promise<unknown[]> {
     context?.abortSignal?.throwIfAborted();
     if (!client.running) throw new Error(`LSP client ${client.id} is not running`);
